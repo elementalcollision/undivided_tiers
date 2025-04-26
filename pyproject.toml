@@ -22,9 +22,9 @@ dev = [
 monitoring = [
     "prometheus-client>=0.14.0",
 ]
-pmdk = [
-    "py-pmemobj>=1.0",
-]
+#[pmdk = [
+#    "py-pmemobj>=1.0",
+#]
 
 [build-system]
 requires = ["setuptools>=61", "setuptools-scm>=8.0"]
