@@ -3,6 +3,7 @@ import torch
 import logging
 import tempfile
 import shutil
+import os
 
 from vua.core import VUA, VUAConfig
 from vua.serdes import tensor_to_bytes, bytes_to_tensor
@@ -46,10 +47,6 @@ class TestVUAConfig(unittest.TestCase):
 
 
     def test_put_get(self):
-        import tempfile
-        import os
-        import logging
-
         # Create a temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
             vua_path = os.path.join(temp_dir, 'vua')
@@ -98,6 +95,62 @@ class TestVUAConfig(unittest.TestCase):
                                          size=(3, cache.config().split_factor * 10), dtype=torch.uint16)
             batched_kvcache = generate_rand_kvcache(24, batched_seqs.size(1), batched_seqs.size(0), 8, 16)
             cache.put(batched_seqs, batched_kvcache)
+
+    def test_put_get_mock_backend(self):
+        """Test VUA put/get with the MockPMDKBackend."""
+        mock_backend = MockPMDKBackend()
+        cache = VUA(VUAConfig, ".", backend=mock_backend) # root_path is irrelevant for mock
+        tokens = torch.arange(VUAConfig.split_factor * 2)
+        kvcache = generate_rand_kvcache(1, VUAConfig.split_factor * 2, 1, 1, 1)
+        cache.put(tokens, kvcache)
+        res = cache.get_closest(tokens, device="cpu")
+        self.assertIsNotNone(res)
+        # Further checks could compare res.data with original kvcache (after slicing/serdes)
+
+    def test_put_get_tiered_backend(self):
+        """Test VUA put/get with the TieredBackend using mocks."""
+        tier_configs = [
+            {'name': 'tier0', 'capacity_count': 1, 'capacity_bytes': 1000},
+            {'name': 'tier1', 'capacity_count': 1, 'capacity_bytes': 1000},
+        ]
+        backends = [MockPMDKBackend(), MockPMDKBackend()]
+        tiered_backend = TieredBackend(backends, tier_configs)
+        cache = VUA(VUAConfig, ".", backend=tiered_backend)
+        tokens1 = torch.arange(VUAConfig.split_factor)
+        tokens2 = torch.arange(VUAConfig.split_factor, VUAConfig.split_factor * 2)
+        kvcache1 = generate_rand_kvcache(1, VUAConfig.split_factor, 1, 1, 1)
+        kvcache2 = generate_rand_kvcache(1, VUAConfig.split_factor, 1, 1, 1)
+        cache.put(tokens1, kvcache1) # Goes to tier 0
+        cache.put(tokens2, kvcache2) # Should demote tokens1 to tier 1
+        res1 = cache.get_closest(tokens1, device="cpu")
+        res2 = cache.get_closest(tokens2, device="cpu")
+        self.assertIsNotNone(res1)
+        self.assertIsNotNone(res2)
+        self.assertEqual(tiered_backend.metadata['testhash0']['tier'], 1) # Check if demoted
+        self.assertEqual(tiered_backend.metadata['testhash1']['tier'], 0) # Check if in top tier
+
+    def test_repair_symlinks(self):
+        """Test the repair_symlinks functionality."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vua_path = os.path.join(temp_dir, 'vua')
+            os.mkdir(vua_path)
+            cache = VUA(VUAConfig, vua_path)
+            tokens = torch.arange(VUAConfig.split_factor * 3)
+            kvcache = generate_rand_kvcache(1, VUAConfig.split_factor * 3, 1, 1, 1)
+            cache.put(tokens, kvcache)
+            # Manually break a symlink
+            path_components = VUAConfig.tokens_to_paths(tokens)
+            link_path = os.path.join(vua_path, path_components[1], "parent")
+            if os.path.exists(link_path):
+                os.remove(link_path)
+            self.assertFalse(os.path.exists(link_path))
+            # Run repair
+            cache.repair_symlinks()
+            # Check if symlink was restored
+            self.assertTrue(os.path.islink(link_path))
+            target = os.readlink(link_path)
+            expected_target = os.path.join("..", path_components[0])
+            self.assertEqual(target, expected_target)
 
 
 class TestSerdes(unittest.TestCase):
@@ -205,6 +258,26 @@ class TestTieredBackend(unittest.TestCase):
         for f in ['frag6', 'frag7', 'frag8', 'frag9', 'frag10', 'frag11', 'frag12']:
             if f not in all_frags:
                 self.assertIsNone(self.tiered.get(f))
+
+    def test_proactive_demotion_watermark(self):
+        """Test proactive demotion when tier usage exceeds watermark."""
+        # Configure tier 0 to have capacity 2, watermark 0.5 (so >1 item triggers demotion)
+        self.tier_configs[0]['watermark'] = 0.5
+        self.tiered.put('fragA', b'dataA', b'tokensA') # Should stay
+        self.tiered.put('fragB', b'dataB', b'tokensB') # Should trigger demotion of fragA
+        self.assertEqual(self.tiered.metadata['fragA']['tier'], 1)
+        self.assertEqual(self.tiered.metadata['fragB']['tier'], 0)
+
+    def test_dynamic_threshold_adjustment(self):
+        """Test that thresholds adjust based on hit rate (simple case)."""
+        self.tiered._demote('fragC', 0, 1) # Move to tier 1
+        initial_promo_threshold = self.tiered.tier_configs[1].get('promotion_threshold', 1)
+        # Simulate low hit rate by missing frequently
+        for _ in range(self.tiered.adjustment_interval):
+            self.tiered.get('nonexistent')
+        # Check if promotion threshold decreased
+        new_promo_threshold = self.tiered.tier_configs[1]['promotion_threshold']
+        self.assertLess(new_promo_threshold, initial_promo_threshold)
 
 
 if __name__ == '__main__':

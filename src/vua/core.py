@@ -11,6 +11,7 @@ logger.addHandler(logging.NullHandler())
 
 
 from . import serdes
+from .backend import FileSystemBackend, StorageBackend
 
 
 class SplitFactorError(Exception):
@@ -89,9 +90,13 @@ class ClosestKV(NamedTuple):
 
 
 class VUA:
-    def __init__(self, config, root_path):
+    def __init__(self, config, root_path, backend: StorageBackend = None):
         self._config = config
         self._root_path = root_path
+        if backend is None:
+            self._backend = FileSystemBackend(root_path)
+        else:
+            self._backend = backend
 
     def config(self) -> VUAConfig:
         """
@@ -131,8 +136,6 @@ class VUA:
             raise Exception(f"input token tensor dimension too big {tokens.dim()}")
 
         if tokens.dim() == 2:
-            # TODO: we can optimize for common prefixes here. For now it will just
-            # be parallel.
             threads = []
             assert data[0][0].size(0) == tokens.size(0), "number token sequences should match batch_head"
             for i in range(tokens.size(0)):
@@ -148,7 +151,6 @@ class VUA:
         tokens = tokens.squeeze()
         path_components = self._config.tokens_to_paths(tokens)
 
-        # Start with the root path
         def save_group(group_hash, group_idx):
             group_dir = os.path.join(self._root_path, group_hash)
             if os.path.exists(group_dir):
@@ -159,10 +161,8 @@ class VUA:
                 os.mkdir(group_dir_tmp)
                 logger.debug(f"group #{group_idx}: dir created {group_dir_tmp}")
             except OSError:
-                # check for FileExists
                 pass
 
-            # Create symlink to parent if not the first group
             if group_idx > 0:
                 parent_hash = path_components[group_idx - 1]
                 parent_link = os.path.join(group_dir_tmp, "parent")
@@ -171,7 +171,6 @@ class VUA:
                 except FileExistsError:
                     pass
 
-            # Prepare data and tokens for this group
             sliced_group = []
             for layer in data:
                 x = []
@@ -180,20 +179,12 @@ class VUA:
                     x.append(t2.clone())
                 sliced_group.append(torch.stack(x))
 
-            sliced_group = serdes.tensor_to_bytes(torch.stack(sliced_group), group_hash + ".data")
-            sliced_tokens = serdes.tensor_to_bytes(tokens[group_idx*self._config.split_factor:
-                                   (group_idx+1)*self._config.split_factor].clone(), group_hash + ".tokens")
+            sliced_group_bytes = serdes.tensor_to_bytes(torch.stack(sliced_group), group_hash + ".data")
+            sliced_tokens_bytes = serdes.tensor_to_bytes(tokens[group_idx*self._config.split_factor:
+                                       (group_idx+1)*self._config.split_factor].clone(), group_hash + ".tokens")
 
-            # Write data and tokens files
-            fd = os.open(os.path.join(group_dir_tmp, "_data.safetensors"), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-            with os.fdopen(fd, 'wb') as file:
-                file.write(sliced_group)
-                os.fsync(fd)
-
-            fd = os.open(os.path.join(group_dir_tmp, "_tokens.safetensors"), os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-            with os.fdopen(fd, 'wb') as file:
-                file.write(sliced_tokens)
-                os.fsync(fd)
+            # Use backend to store data and tokens
+            self._backend.put(group_hash, sliced_group_bytes, sliced_tokens_bytes)
 
             os.rename(group_dir_tmp, group_dir)
 
@@ -234,8 +225,6 @@ class VUA:
             logger.debug(f"get with tokens.size()={tokens.size()} tokens")
         elif isinstance(tokens, list) and \
                 all(isinstance(t, torch.Tensor) and t.dim() == 1 for t in tokens):
-            # TODO: we can optimize for common prefixes here. For now it will just
-            # be parallel.
             tokens_groups = tokens
             threads = []
             results = [None] * len(tokens_groups)
@@ -258,23 +247,18 @@ class VUA:
         logger.debug(f"tokens shape: {tokens.size()}")
         path_components = self._config.tokens_to_paths(tokens)
 
-        # Each group is now a flat directory under root, with symlinks to parent
         threads = []
 
         def load_group(group_hash, group_idx):
-            group_dir = os.path.join(self._root_path, group_hash)
-            try:
-                tokens = None
-                data = None
-                logger.debug(f"loading group idx {group_idx}")
-                with open(os.path.join(group_dir, "_tokens.safetensors"), "rb") as file:
-                    tokens = serdes.bytes_to_tensor(file.read(), group_hash + ".tokens")
-                with open(os.path.join(group_dir, "_data.safetensors"), "rb") as file:
-                    data = serdes.bytes_to_tensor(file.read(), group_hash + ".data")
-                logger.debug(f"done loading group idx {group_idx}")
-                results.append((group_idx, group_hash, (tokens, data)))
-            except FileNotFoundError:
+            # Use backend to load data and tokens
+            loaded = self._backend.get(group_hash)
+            if loaded is None:
                 logger.debug(f"group {group_hash} not found")
+                return
+            data_bytes, tokens_bytes = loaded
+            tokens_tensor = serdes.bytes_to_tensor(tokens_bytes, group_hash + ".tokens")
+            data_tensor = serdes.bytes_to_tensor(data_bytes, group_hash + ".data")
+            results.append((group_idx, group_hash, (tokens_tensor, data_tensor)))
 
         for group_idx, group_hash in enumerate(path_components):
             t = threading.Thread(target=load_group, args=(group_hash, group_idx))

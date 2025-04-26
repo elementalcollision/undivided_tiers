@@ -17,8 +17,9 @@ VUA is a system for storing and retrieving key-value caches of deep learning mod
 2. **Exploring the Codebase**
 
    - **`src/vua/core.py`**: Contains the primary VUA implementation with `put()` and `get_closest()`, plus token-to-path conversion logic.
-   - **`src/vua/serdes.py`**: Provides tensor serialization/deserialization functions (`tensor_to_bytes` and `bytes_to_tensor`) for efficiently handling PyTorch tensors. Compatible to safetensors.
-   - **`tests/test_vua.py`**: Offers tests to validate token processing, cache storage and retrieval, and tensor serialization.
+   - **`src/vua/serdes.py`**: Provides tensor serialization/deserialization functions (`tensor_to_bytes` and `bytes_to_tensor`).
+   - **`src/vua/backend.py`**: Defines the storage backend abstraction (`StorageBackend`) and implementations like `FileSystemBackend`, `MockPMDKBackend`, `PMDKBackend` (simulated), and `TieredBackend`.
+   - **`tests/test_vua.py`**: Offers tests to validate core logic, backends, and tiering.
 
 3. **Running the Tests**
 
@@ -28,11 +29,11 @@ VUA is a system for storing and retrieving key-value caches of deep learning mod
    ```
 4. **Using VUA in Your Project**
 
-   - Create a VUA instance by providing a configuration (e.g. `VUAConfig`) and a directory path for cache storage.
+   - Create a VUA instance by providing a configuration (`VUAConfig`), a root path, and optionally a custom storage backend (defaults to `FileSystemBackend`).
    - Utilize `put()` to store computed key-value caches and `get_closest()` to retrieve cached data based on token queries.
    - **Batched Operations:** VUA supports batched put and get operations. If you provide a 2D tensor of tokens to `put()`, it processes each sequence in parallel. Similarly, calling `get_closest()` with a list of token tensors returns a list of corresponding `ClosestKV` results.
 
-   **Example:**
+   **Example (Default Filesystem Backend):**
 
    ```python
    import os
@@ -63,21 +64,41 @@ VUA is a system for storing and retrieving key-value caches of deep learning mod
    print("Retrieved data:", result.data)
    ```
 
+   **Example (Tiered Backend):**
+
+   ```python
+   # See example/tiered-backend-example.py for a full example
+   from vua.backend import TieredBackend, MockPMDKBackend, FileSystemBackend
+   # ... imports ...
+   storage_path = "./storage_tier"
+   os.makedirs(storage_path, exist_ok=True)
+   tier_configs = [
+       {'name': 'dram', 'capacity_count': 100, ...},
+       {'name': 'storage', 'capacity_count': 1000, ...},
+   ]
+   backends = [MockPMDKBackend(), FileSystemBackend(storage_path)]
+   tiered_backend = TieredBackend(backends, tier_configs)
+   # Inject the tiered backend
+   vua = VUA(VUAConfig, ".", backend=tiered_backend) # root_path less relevant here
+   # ... use vua.put() and vua.get_closest() ...
+   ```
+
 5. **Examples directory**
 
-   The examples directory contains two main use cases:
+   The examples directory contains:
 
-   - Usage with 'transformers' library
-
-   ```
-   uv run python ./example/on-transformers.py
-   ```
-
-   - Usage to experimental vLLM connector for offline kvcache storage
-
-   ```
-   uv run ./example/serve-vllm.sh
-   ```
+   - Usage with 'transformers' library (`on-transformers.py`)
+     ```
+     uv run python ./example/on-transformers.py
+     ```
+   - Example demonstrating the TieredBackend (`tiered-backend-example.py`)
+     ```
+     uv run python ./example/tiered-backend-example.py
+     ```
+   - Usage with experimental vLLM connector (`vllm_kv_connector_0.py`, `serve-vllm.sh`, etc.)
+     ```
+     uv run ./example/serve-vllm.sh
+     ```
 
 6. **Debugging and Logging**
 

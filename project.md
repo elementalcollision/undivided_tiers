@@ -145,4 +145,17 @@ Prototyping of the metadata table and tier management logic will proceed with th
 
 ---
 
-Prototyping of this logic will begin next. 
+Prototyping of this logic will begin next.
+
+## Next Steps: Dynamic Policy Tuning
+
+### Objectives
+- Implement feedback loops to dynamically adjust promotion/demotion thresholds and watermarks based on observed metrics (e.g., hit/miss rates, tier pressure, access patterns).
+- Experiment with different scoring functions for eviction and promotion (e.g., weighted LRU/LFU, recency/frequency hybrids).
+- Explore adding a learning or heuristic module to predict hot/cold fragments and adapt policies in real time.
+- Ensure all policy parameters are configurable and, where possible, tunable at runtime.
+- Document the impact of dynamic tuning on cache efficiency and system performance.
+
+---
+
+Research and code generation for dynamic policy tuning will proceed next. 
