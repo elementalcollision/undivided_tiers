@@ -4,6 +4,13 @@ import os
 import logging
 import time
 
+# Attempt to import pmemobj - this will fail if not installed
+try:
+    import pmemobj
+except ImportError:
+    pmemobj = None
+    logging.warning("PMDK Python binding (pmemobj) not found. Real PMDKBackend will not be functional.")
+
 # Restored Class Definitions
 class StorageBackend(ABC):
     """
@@ -105,56 +112,138 @@ class MockPMDKBackend(StorageBackend):
     def exists(self, group_hash: str) -> bool:
         return group_hash in self._store
 
+class MockGPURAMBackend(StorageBackend):
+    """
+    Mock backend simulating GPU RAM using an in-memory dict.
+    """
+    def __init__(self):
+        self._store = {}
+
+    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+        self._store[group_hash] = (data, tokens)
+
+    def get(self, group_hash: str) -> Optional[tuple]:
+        return self._store.get(group_hash)
+
+    def exists(self, group_hash: str) -> bool:
+        return group_hash in self._store
+
 class PMDKBackend(StorageBackend):
     """
-    Simulated PMDK backend for VUA. Uses a dedicated directory to mimic a PMDK pool.
-    Each group is stored as files in root_path/pmdk_pool/group_hash/.
-    This is a placeholder for future real PMDK integration.
+    PMDK backend for VUA using libpmemobj.
+    Stores data in a persistent memory pool.
+    Requires the pmemobj Python binding and PMDK installed.
     """
-    def __init__(self, root_path: str):
-        self.pool_path = os.path.join(root_path, "pmdk_pool")
-        os.makedirs(self.pool_path, exist_ok=True)
+    # Define a simple layout name for the pool
+    LAYOUT_NAME = "vua_kv_cache"
+
+    def __init__(self, pool_path: str, pool_size: int = 1024 * 1024 * 1024, create=True):
+        """
+        Initialize the PMDK backend, creating or opening the pool.
+        Args:
+            pool_path: Path to the persistent memory pool file.
+            pool_size: Size of the pool to create (in bytes) if it doesn't exist.
+            create: If True, create the pool if it doesn't exist. If False, only open.
+        """
+        if pmemobj is None:
+            raise ImportError("PMDK pmemobj binding not found. Cannot initialize PMDKBackend.")
+
+        self.pool_path = pool_path
+        self.pool_size = pool_size
+        self.pool = None
+
+        try:
+            if os.path.exists(pool_path):
+                self.logger.info(f"Opening existing PMDK pool: {pool_path}")
+                self.pool = pmemobj.open(pool_path, self.LAYOUT_NAME)
+            elif create:
+                self.logger.info(f"Creating new PMDK pool: {pool_path} (size: {pool_size} bytes)")
+                self.pool = pmemobj.create(pool_path, self.LAYOUT_NAME, pool_size)
+                # Initialize the root object (e.g., a persistent dict)
+                with self.pool.transaction():
+                    self.pool.root = pmemobj.PersistentDict()
+            else:
+                raise FileNotFoundError(f"PMDK pool file not found and create=False: {pool_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to open or create PMDK pool at {pool_path}: {e}")
+            raise
+
+        self.logger = logging.getLogger(f"PMDKBackend({pool_path})")
 
     def put(self, group_hash: str, data: Any, tokens: Any) -> None:
         """
-        Simulate storing data and tokens in a PMDK pool by writing to files in a dedicated directory.
-        TODO: Replace with real PMDK object store logic when available.
+        Store data and tokens persistently in the PMDK pool.
+        Uses a transaction for atomicity.
         """
-        group_dir = os.path.join(self.pool_path, group_hash)
-        os.makedirs(group_dir, exist_ok=True)
-        data_path = os.path.join(group_dir, "_data.safetensors")
-        tokens_path = os.path.join(group_dir, "_tokens.safetensors")
-        with open(data_path, "wb") as f:
-            f.write(data)
-        with open(tokens_path, "wb") as f:
-            f.write(tokens)
+        if self.pool is None:
+            raise RuntimeError("PMDK pool is not open.")
+
+        try:
+            with self.pool.transaction():
+                # Allocate persistent memory for data and tokens
+                # Note: pmemobj might require specific types (e.g., PersistentBytes)
+                # This assumes data/tokens are bytes; adjust if needed.
+                persistent_data = pmemobj.PersistentBytes(data)
+                persistent_tokens = pmemobj.PersistentBytes(tokens)
+                # Store in the root persistent dictionary
+                self.pool.root[group_hash] = (persistent_data, persistent_tokens)
+        except Exception as e:
+            self.logger.error(f"Failed to put {group_hash} into PMDK pool: {e}")
+            # TODO: Handle specific PMDK errors (e.g., out of space)
+            raise
 
     def get(self, group_hash: str) -> Optional[tuple]:
         """
-        Simulate retrieving data and tokens from a PMDK pool by reading from files.
-        TODO: Replace with real PMDK object store logic when available.
+        Retrieve data and tokens from the PMDK pool.
+        Returns a tuple of (bytes, bytes) or None if not found.
         """
-        group_dir = os.path.join(self.pool_path, group_hash)
-        data_path = os.path.join(group_dir, "_data.safetensors")
-        tokens_path = os.path.join(group_dir, "_tokens.safetensors")
+        if self.pool is None:
+            raise RuntimeError("PMDK pool is not open.")
+
         try:
-            with open(data_path, "rb") as f:
-                data = f.read()
-            with open(tokens_path, "rb") as f:
-                tokens = f.read()
-            return (data, tokens)
-        except (FileNotFoundError, IsADirectoryError):
-            return None
+            persistent_tuple = self.pool.root.get(group_hash)
+            if persistent_tuple:
+                # Return copies as regular bytes
+                data_bytes = bytes(persistent_tuple[0])
+                tokens_bytes = bytes(persistent_tuple[1])
+                return (data_bytes, tokens_bytes)
+            else:
+                return None
+        except Exception as e:
+            self.logger.error(f"Failed to get {group_hash} from PMDK pool: {e}")
+            # TODO: Handle specific PMDK errors
+            raise
 
     def exists(self, group_hash: str) -> bool:
         """
-        Simulate checking for a group in a PMDK pool by checking for files in the directory.
-        TODO: Replace with real PMDK object store logic when available.
+        Check if a group hash exists as a key in the PMDK pool's root dictionary.
         """
-        group_dir = os.path.join(self.pool_path, group_hash)
-        data_path = os.path.join(group_dir, "_data.safetensors")
-        tokens_path = os.path.join(group_dir, "_tokens.safetensors")
-        return os.path.isdir(group_dir) and os.path.isfile(data_path) and os.path.isfile(tokens_path)
+        if self.pool is None:
+            raise RuntimeError("PMDK pool is not open.")
+
+        try:
+            return group_hash in self.pool.root
+        except Exception as e:
+            self.logger.error(f"Failed to check existence of {group_hash} in PMDK pool: {e}")
+            # TODO: Handle specific PMDK errors
+            raise
+
+    def close(self):
+        """
+        Close the PMDK pool.
+        """
+        if self.pool:
+            try:
+                self.pool.close()
+                self.logger.info(f"Closed PMDK pool: {self.pool_path}")
+            except Exception as e:
+                self.logger.error(f"Error closing PMDK pool {self.pool_path}: {e}")
+            finally:
+                self.pool = None
+
+    def __del__(self):
+        # Ensure pool is closed when object is garbage collected
+        self.close()
 
 # TieredBackend follows
 

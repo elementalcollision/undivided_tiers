@@ -11,7 +11,14 @@ import shutil
 from typing import Any, Optional
 
 from vua.core import VUA, VUAConfig
-from vua.backend import TieredBackend, MockPMDKBackend, FileSystemBackend
+from vua.backend import (
+    TieredBackend,
+    MockPMDKBackend,
+    FileSystemBackend,
+    MockGPURAMBackend,
+    PMDKBackend,
+    StorageBackend
+)
 
 def generate_rand_kvcache(n_layers, seq_len, batch_size, num_heads, head_size):
     # Simplified version for example
@@ -22,54 +29,73 @@ def generate_rand_kvcache(n_layers, seq_len, batch_size, num_heads, head_size):
         layers.append([t, t.clone()]) # Simulating K and V
     return layers
 
-# Assuming MockPMDKBackend simulates DRAM or PMEM, and we need another mock for GPU RAM
-class MockGPURAMBackend(StorageBackend):
-    """
-    Mock backend simulating GPU RAM using an in-memory dict.
-    """
-    def __init__(self):
-        self._store = {}
-
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
-        self._store[group_hash] = (data, tokens)
-
-    def get(self, group_hash: str) -> Optional[tuple]:
-        return self._store.get(group_hash)
-
-    def exists(self, group_hash: str) -> bool:
-        return group_hash in self._store
-
 def main():
+    parser = argparse.ArgumentParser(description="VUA Tiered Backend Example")
+    parser.add_argument("--tier0-backend", default="mock_gpu", choices=["mock_gpu", "mock_dram", "fs", "pmdk"], help="Backend for Tier 0 (fastest)")
+    parser.add_argument("--tier1-backend", default="mock_dram", choices=["mock_gpu", "mock_dram", "fs", "pmdk"], help="Backend for Tier 1")
+    parser.add_argument("--tier2-backend", default="fs", choices=["mock_gpu", "mock_dram", "fs", "pmdk"], help="Backend for Tier 2 (slowest)")
+    parser.add_argument("--fs-path", default=None, help="Path for FileSystemBackend (used if 'fs' is selected for any tier)")
+    parser.add_argument("--pmdk-path", default=None, help="Path for PMDK pool file (used if 'pmdk' is selected for any tier)")
+    parser.add_argument("--pmdk-size", type=int, default=1024*1024*100, help="Size (bytes) for PMDK pool creation") # 100MB default
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set logging level")
+    args = parser.parse_args()
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, args.log_level.upper()),
         format='%(asctime)s.%(msecs)03d [%(levelname)s] - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S')
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        storage_path = os.path.join(temp_dir, 'storage_tier')
-        os.makedirs(storage_path)
+        default_fs_path = args.fs_path or os.path.join(temp_dir, 'storage_tier')
+        default_pmdk_path = args.pmdk_path or os.path.join(temp_dir, 'pmdk.pool')
+        os.makedirs(os.path.dirname(default_fs_path), exist_ok=True)
+        os.makedirs(os.path.dirname(default_pmdk_path), exist_ok=True)
 
-        # Configure Tiers (GPU RAM + DRAM + Filesystem Storage)
+        def create_backend(backend_type, tier_idx):
+            if backend_type == "mock_gpu":
+                logging.info(f"Using MockGPURAMBackend for Tier {tier_idx}")
+                return MockGPURAMBackend()
+            elif backend_type == "mock_dram":
+                logging.info(f"Using MockPMDKBackend (as DRAM) for Tier {tier_idx}")
+                return MockPMDKBackend()
+            elif backend_type == "fs":
+                path = default_fs_path + f"_t{tier_idx}" # Ensure unique paths if multiple FS tiers
+                logging.info(f"Using FileSystemBackend for Tier {tier_idx} at {path}")
+                return FileSystemBackend(path)
+            elif backend_type == "pmdk":
+                path = default_pmdk_path + f"_t{tier_idx}" # Ensure unique paths if multiple PMDK tiers
+                logging.info(f"Using PMDKBackend for Tier {tier_idx} at {path} (size: {args.pmdk_size})")
+                try:
+                    # Attempt to create/open the pool
+                    return PMDKBackend(path, pool_size=args.pmdk_size, create=True)
+                except ImportError as e:
+                    logging.error(f"Cannot use PMDK backend: {e}. Falling back to Mock DRAM.")
+                    return MockPMDKBackend()
+                except Exception as e:
+                    logging.error(f"Error initializing PMDK backend at {path}: {e}. Falling back to Mock DRAM.")
+                    return MockPMDKBackend()
+            else:
+                raise ValueError(f"Unknown backend type: {backend_type}")
+
+        # Configure Tiers based on args
         tier_configs = [
-            {'name': 'gpu', 'capacity_count': 1, 'capacity_bytes': 10000, 'promotion_threshold': 2, 'watermark': 0.9},
-            {'name': 'dram', 'capacity_count': 2, 'capacity_bytes': 20000, 'promotion_threshold': 2, 'watermark': 0.9},
-            {'name': 'storage', 'capacity_count': 10, 'capacity_bytes': 50000, 'promotion_threshold': 2, 'watermark': 0.9},
+            {'name': 'tier0', 'capacity_count': 1, 'capacity_bytes': 10000, 'promotion_threshold': 2, 'watermark': 0.9},
+            {'name': 'tier1', 'capacity_count': 2, 'capacity_bytes': 20000, 'promotion_threshold': 2, 'watermark': 0.9},
+            {'name': 'tier2', 'capacity_count': 10, 'capacity_bytes': 50000, 'promotion_threshold': 2, 'watermark': 0.9},
         ]
         backends = [
-            MockGPURAMBackend(), # Tier 0: Mock GPU RAM
-            MockPMDKBackend(), # Tier 1: Mock DRAM
-            FileSystemBackend(storage_path) # Tier 2: Storage
+            create_backend(args.tier0_backend, 0),
+            create_backend(args.tier1_backend, 1),
+            create_backend(args.tier2_backend, 2),
         ]
 
         # Create TieredBackend
         tiered_backend = TieredBackend(backends, tier_configs)
 
         # Instantiate VUA with TieredBackend
-        # Note: root_path for VUA is less relevant when using a custom backend,
-        # but required by the constructor. We pass temp_dir.
         cache = VUA(VUAConfig, temp_dir, backend=tiered_backend)
 
-        logging.info("--- Tiered Backend Example (3 Tiers) ---")
+        logging.info(f"--- Tiered Backend Example ({args.tier0_backend}/{args.tier1_backend}/{args.tier2_backend}) ---")
 
         # Generate sample data
         tokens1 = VUAConfig.trim_to_split_factor(torch.randint(0, 1000, (VUAConfig.split_factor,))) # Group 0
