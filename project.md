@@ -113,6 +113,11 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
     - Made internal policy thresholds (`base_promotion_score_threshold`, `base_demotion_score_threshold`) configurable via `PolicyConfig`.
     - Refactored `TieredBackend._feedback_adjust_thresholds` to target `PolicyConfig` parameters.
     - Implemented initial heuristics for tuning exploration rate and score thresholds.
+- [x] **Policy Tuning & Optimization (Benchmarking Script):**
+    - Created `scripts/benchmark_policy.py` with argparse for configuration.
+    - Implemented workload generation (random, sequential, zipfian).
+    - Added performance metrics collection (time, OPS, hit rate, latency).
+    - Included CSV output for results logging.
 
 ## Colloid-Inspired Tiering Algorithm Outline
 
@@ -201,11 +206,13 @@ Prototyping of this logic will begin next.
 - Base LeCAR policy implementation complete with configuration and advanced metrics.
 - Unit tests for LeCAR policy logic are in place.
 - Feedback loop mechanism implemented to tune policy parameters.
+- Initial benchmarking script (`scripts/benchmark_policy.py`) created.
 
 ### Remaining Tasks
 1.  **Policy Tuning & Optimization (Refinement & Benchmarking)**
-    - [ ] **Benchmarking:** Develop scripts/workloads to measure performance impact of different policy configurations and tuning heuristics.
-    - [ ] **Refine Heuristics:** Analyze benchmark results and refine the tuning logic in `_feedback_adjust_thresholds` based on data.
+    - [ ] **Run Benchmarks:** Execute `benchmark_policy.py` with various configurations (workloads, tiers, policy params).
+    - [ ] **Analyze Results:** Study the output CSV to understand performance trade-offs and policy behavior.
+    - [ ] **Refine Heuristics:** Update tuning logic in `_feedback_adjust_thresholds` based on benchmark analysis.
     - [ ] **Adaptive Exploration (Optional):** Investigate/implement more advanced adaptation for exploration rate.
     - [ ] **Workload-Specific Tuning (Optional):** Explore methods for detecting and adapting to different workload patterns.
 2.  **Testing & Validation (Integration)**
@@ -218,57 +225,15 @@ Prototyping of this logic will begin next.
     - [ ] Include performance tuning recommendations based on benchmarking.
 
 ### Implementation Priority
-1. Policy Tuning & Optimization (Benchmarking first)
+1. Policy Tuning & Optimization (Run Benchmarks & Analyze)
 2. Testing & Validation (Integration for tuning)
 3. Documentation & Examples
 
 ---
 
-Development of Benchmarking scripts will proceed next.
+Execution of Benchmarking runs and analysis will proceed next.
 
 ## Next Steps: Real PMDK Integration
 
 ### Objectives
-- Replace the simulated file-based logic in `src/vua/backend.py::PMDKBackend` with calls to a real PMDK Python binding (likely `py-pmemobj`).
-- Implement PMDK pool creation/opening (`pmemobj_create`/`pmemobj_open`) in the backend's constructor.
-- Utilize persistent memory allocation (e.g., `pmemobj_alloc`) and transactional updates within the PMDK pool for `put`, `get`, and `exists` operations, using the `group_hash` as a key.
-- Add robust error handling for PMDK-specific issues (pool errors, allocation failures).
-- Ensure the implementation remains modular, encapsulating PMDK specifics within `PMDKBackend` and adhering to the `StorageBackend` interface, allowing for potential future integration of other CXL SDKs via separate backend classes.
-- Add necessary configuration options (pool path, size, layout name) for the `PMDKBackend`.
-
----
-
-Refactoring of `PMDKBackend` will proceed next.
-
-## Next Steps: Prometheus Integration for Metrics
-
-### Objectives
-- Export key TieredBackend metrics (hits, misses, promotions, demotions, evictions, tier usage, dynamic thresholds) to Prometheus.
-- Enable real-time monitoring and offline analysis of cache performance and policy effectiveness.
-
-### Approach
-- Utilize the `prometheus-client` Python library.
-- Define Prometheus Counters and Gauges within `TieredBackend`, labeled by tier, for aggregated metrics (hits, misses, usage, thresholds, etc.).
-- Define Prometheus `Histogram` or `Summary` metrics to track distributions of key per-fragment metadata (e.g., fragment age, access counts, size) per tier.
-- Calculate and update aggregated/distribution metrics periodically.
-- Update metrics within relevant backend methods.
-- Expose metrics via an optional HTTP endpoint for Prometheus scraping.
-- **Note:** Avoid exporting raw per-fragment metadata directly to Prometheus due to cardinality concerns; use aggregated statistics and distributions instead.
-
-### Implementation Steps
-1. Add `prometheus-client` as an optional dependency.
-2. Define Prometheus metric objects (Counters, Gauges, Histograms/Summaries) in `TieredBackend` constructor.
-3. Increment/set counters and basic gauges in relevant backend methods.
-4. Implemented logic to calculate and update aggregated/distribution metrics (Histograms/Summaries, advanced metadata counts, avg scores) periodically (e.g., in `export_metrics`).
-5. Add option to example script to start Prometheus HTTP server.
-6. Update documentation.
-
----
-
-Implementation of Prometheus integration (including aggregated metrics) is complete.
-
-- [x] Implement Prometheus Integration for Metrics (within TieredBackend)
-    - Defined Counters, Gauges, Histograms for key metrics.
-    - Integrated metric updates into backend operations.
-    - Added helper methods for exporting aggregates and starting HTTP server.
-    - Remaining: Update example scripts, documentation. 
+- Replace the simulated file-based logic in `

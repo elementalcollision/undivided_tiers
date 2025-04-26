@@ -155,3 +155,52 @@ The TieredBackend now supports dynamic adjustment of key policy parameters:
 
 These adjustments are made automatically at runtime, logged for traceability, and exposed as Prometheus metrics for observability. Comprehensive tests validate that these thresholds and watermarks adjust as expected under different usage scenarios.
 
+## Key Features
+
+- **Key-Value Caching:** Stores and retrieves deep learning model KV caches.
+- **Token-Based Directory Structure:** Efficiently organizes cache fragments based on token sequences.
+- **Batched Operations:** Supports parallel processing of multiple sequences.
+- **Pluggable Storage Backends:** Allows using different storage types:
+    - `FileSystemBackend`: Standard file system storage.
+    - `PMDKBackend`: (Experimental) Integration with Intel PMDK for persistent memory (requires `py-pmemobj`).
+    - Mock Backends: `MockGPURAMBackend`, `MockPMDKBackend` for testing.
+- **Tiered Storage (`TieredBackend`):** Manages data across multiple storage tiers (e.g., RAM, PMEM, Disk).
+    - **Adaptive Policy (LeCAR):** Uses a learning cache policy (LeCAR) combining LRU and LFU with adaptive weights based on ghost cache hits.
+    - **Dynamic Tuning:** Automatically adjusts policy parameters (e.g., exploration rate, promotion/demotion score thresholds) based on observed metrics like hit rates and tier usage via a feedback loop (`_feedback_adjust_thresholds`).
+    - **Configurable Policy:** LeCAR policy parameters (`learning_rate`, `exploration_rate`, initial weights, score thresholds, etc.) are configurable via `PolicyConfig`.
+    - **Prometheus Metrics:** Exports detailed metrics for tier usage, cache performance, policy state (weights, ghost cache size), and score distributions.
+
+## Benchmarking Policy Performance
+
+A benchmarking script is available to evaluate the performance and adaptation of the `TieredBackend` with the `LeCAR` policy under various conditions.
+
+**Location:** `scripts/benchmark_policy.py`
+
+**Purpose:**
+- Measure key performance metrics (OPS, latency, hit rate).
+- Observe how policy weights and tier usage evolve under different workloads.
+- Compare the effectiveness of different policy configurations.
+- Gather data to refine tuning heuristics.
+
+**How to Run:**
+- Execute from the workspace root: `python scripts/benchmark_policy.py [OPTIONS]`
+- Use `python scripts/benchmark_policy.py -h` to see all available options.
+
+**Key Configuration Options:**
+- **Workload:** `-n` (num ops), `-i` (num items), `-w` (type: `random`, `sequential`, `zipfian`), `-r` (read ratio), `--zipf-param`.
+- **Tier Capacities:** `--cap-t0`, `--cap-t1`, `--cap-t2` (item counts).
+- **Policy (`PolicyConfig`):** `--lr` (learning rate), `--er` (exploration rate), `--w-lru`/`--w-lfu` (initial weights), `--ttl` (ghost TTL), `--w-min`/`--w-max` (weight bounds), `--p-thresh` (base promotion threshold), `--d-thresh` (base demotion threshold).
+- **Backend:** `--adj-interval` (feedback loop frequency).
+- **Output:** `-o` (CSV file to append results).
+
+**Example:**
+```bash
+# Requires numpy for zipfian
+# pip install numpy 
+python scripts/benchmark_policy.py -n 20000 -i 2000 -w zipfian --zipf-param 1.2 --cap-t0 150 --cap-t1 600 --cap-t2 1500 --lr 0.15 --er 0.05 --p-thresh 0.65 --d-thresh 0.35 -o zipfian_test.csv
+```
+
+**Relevant Files:**
+- `src/vua/backend.py`: Contains `TieredBackend`, `LeCAR`, `PolicyConfig`.
+- `scripts/benchmark_policy.py`: The benchmarking script itself.
+
