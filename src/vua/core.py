@@ -311,3 +311,54 @@ class VUA:
 
         tokens = torch.cat(tokens_groups, dim=0).to(device=device)
         return ClosestKV(tokens=tokens, data=data)
+
+    def repair_symlinks(self):
+        """
+        Traverse all group directories in the cache root, check the 'parent' symlink in each,
+        and repair or report missing/broken symlinks. Logs actions taken. Safe to run multiple times.
+        """
+        import os
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"Starting symlink repair in {self._root_path}")
+
+        # List all directories in the root path
+        group_dirs = [d for d in os.listdir(self._root_path)
+                      if os.path.isdir(os.path.join(self._root_path, d)) and not d.endswith('.tmp')]
+        group_dirs.sort()  # Sort for deterministic order
+
+        for group_dir in group_dirs:
+            full_group_dir = os.path.join(self._root_path, group_dir)
+            parent_link = os.path.join(full_group_dir, "parent")
+            if os.path.exists(parent_link):
+                # Check if it's a symlink and if it points to a valid directory
+                if not os.path.islink(parent_link):
+                    logger.warning(f"'{parent_link}' exists but is not a symlink. Skipping.")
+                    continue
+                target = os.readlink(parent_link)
+                target_path = os.path.normpath(os.path.join(full_group_dir, target))
+                if not os.path.isdir(target_path):
+                    logger.warning(f"'{parent_link}' is a broken symlink. Removing and attempting repair.")
+                    os.remove(parent_link)
+                else:
+                    # Symlink exists and is valid
+                    continue
+            # Try to infer the parent directory (by convention, one level up, any sibling hash)
+            # This is a best-effort guess: look for a sibling directory and link to it if possible
+            siblings = [d for d in group_dirs if d != group_dir]
+            if siblings:
+                # Pick the lexicographically previous sibling as parent, if possible
+                idx = group_dirs.index(group_dir)
+                if idx > 0:
+                    parent_hash = group_dirs[idx - 1]
+                    rel_path = os.path.join("..", parent_hash)
+                    try:
+                        os.symlink(rel_path, parent_link)
+                        logger.info(f"Created missing symlink: {parent_link} -> {rel_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to create symlink {parent_link} -> {rel_path}: {e}")
+                else:
+                    logger.info(f"No parent for first group directory: {group_dir}")
+            else:
+                logger.info(f"No siblings found for {group_dir}, cannot infer parent.")

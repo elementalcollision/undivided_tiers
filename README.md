@@ -79,10 +79,22 @@ VUA is a system for storing and retrieving key-value caches of deep learning mod
    uv run ./example/serve-vllm.sh
    ```
 
-
 6. **Debugging and Logging**
 
    VUA leverages Python’s `logging` module for detailed debug output. Configure custom log handlers during development to monitor directory navigation and cache operations effectively.
+
+# Repairing Symlinks in the Cache Directory
+
+If your VUA cache directory has missing or broken `parent` symlinks (for example, due to interrupted writes or manual changes), you can repair them using the provided CLI tool:
+
+```
+python scripts/repair_symlinks.py /path/to/vua_cache --log-level DEBUG
+```
+
+- Replace `/path/to/vua_cache` with the path to your cache directory.
+- The `--log-level` flag is optional and can be set to `DEBUG`, `INFO`, `WARNING`, or `ERROR`.
+
+This script will scan all group directories in the cache, check for missing or broken `parent` symlinks, and repair them where possible. It is safe to run multiple times.
 
 # License
 
