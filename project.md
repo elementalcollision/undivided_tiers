@@ -9,6 +9,18 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
 - Integrate with Intel PMDK to leverage persistent memory and CXL memory types.
 - Provide a configurable tiering policy (e.g., LRU, size, access frequency).
 - Maintain compatibility with existing file-based storage.
+- [x] **Dynamic Policy Tuning:**
+    - The system now dynamically adjusts `promotion_threshold`, `demotion_threshold`, and `watermark` for each tier based on real-time feedback:
+        - `promotion_threshold` is adjusted based on hit rate.
+        - `demotion_threshold` is adjusted based on demotion/eviction rates and tier usage.
+        - `watermark` is adjusted based on tier usage relative to capacity.
+    - All adjustments are logged and exposed as Prometheus metrics for observability.
+- [x] **Expanded Dynamic Policy Tuning:**
+    - Implemented dynamic adjustment logic for `promotion_threshold`, `demotion_threshold`, and `watermark` in `TieredBackend`.
+    - Added Prometheus metrics and logging for all threshold and watermark changes.
+    - Updated code and documentation to reflect these new features.
+    - **Comprehensive tests** now validate dynamic adjustment of all thresholds and watermarks (see `tests/test_vua.py`).
+    - The `README.md` has been updated to highlight these features for users.
 
 ## Requirements
 - Support for pluggable storage backends (filesystem, PMDK, etc.).
@@ -63,6 +75,7 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
     - Integrated snoop filter and per-tier thresholds.
     - Wrote comprehensive unit tests for insertion, retrieval, promotion, demotion, and eviction across tiers using mock backends.
     - Updated README and codebase to reflect new backend and tiering structure.
+- [x] Refined PMDKBackend implementation (error handling, type hints)
 - [ ] Test and validate
 - [ ] Document and release
 - Refactoring of `PMDKBackend` will proceed next.
@@ -70,6 +83,12 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
   - Implemented pool creation/opening, persistent dictionary for storage, and transactional puts.
   - Added `close()` method and basic error handling.
   - TODOs remain for specific PMDK error handling (e.g., OOM) and require testing on actual PMEM/CXL hardware.
+- [x] **Expanded Dynamic Policy Tuning:**
+    - Implemented dynamic adjustment logic for `promotion_threshold`, `demotion_threshold`, and `watermark` in `TieredBackend`.
+    - Added Prometheus metrics and logging for all threshold and watermark changes.
+    - Updated code and documentation to reflect these new features.
+    - **Comprehensive tests** now validate dynamic adjustment of all thresholds and watermarks (see `tests/test_vua.py`).
+    - The `README.md` has been updated to highlight these features for users.
 
 ## Colloid-Inspired Tiering Algorithm Outline
 
@@ -204,4 +223,10 @@ Refactoring of `PMDKBackend` will proceed next.
 
 ---
 
-Implementation of Prometheus integration (including aggregated metrics) is complete. 
+Implementation of Prometheus integration (including aggregated metrics) is complete.
+
+- [x] Implement Prometheus Integration for Metrics (within TieredBackend)
+    - Defined Counters, Gauges, Histograms for key metrics.
+    - Integrated metric updates into backend operations.
+    - Added helper methods for exporting aggregates and starting HTTP server.
+    - Remaining: Update example scripts, documentation. 

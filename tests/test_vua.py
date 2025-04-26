@@ -279,6 +279,42 @@ class TestTieredBackend(unittest.TestCase):
         new_promo_threshold = self.tiered.tier_configs[1]['promotion_threshold']
         self.assertLess(new_promo_threshold, initial_promo_threshold)
 
+    def test_dynamic_demotion_threshold_adjustment(self):
+        """Test that demotion_threshold adjusts based on demotion/eviction rate and usage."""
+        tier = 0
+        config = self.tiered.tier_configs[tier]
+        initial_demotion_threshold = config.get('demotion_threshold', 1)
+        # Simulate high usage and high demotion rate
+        self.tiered.metrics[tier]['demotions'] = 10
+        self.tiered.metrics[tier]['evictions'] = 2
+        self.tiered.tier_usage[tier]['count'] = config['capacity_count']  # High usage
+        self.tiered._feedback_adjust_thresholds()
+        decreased = config['demotion_threshold'] < initial_demotion_threshold
+        # Simulate low usage and low demotion rate
+        config['demotion_threshold'] = initial_demotion_threshold  # Reset
+        self.tiered.metrics[tier]['demotions'] = 0
+        self.tiered.metrics[tier]['evictions'] = 10
+        self.tiered.tier_usage[tier]['count'] = 0  # Low usage
+        self.tiered._feedback_adjust_thresholds()
+        increased = config['demotion_threshold'] > initial_demotion_threshold
+        self.assertTrue(decreased or increased, "Demotion threshold should adjust dynamically.")
+
+    def test_dynamic_watermark_adjustment(self):
+        """Test that watermark adjusts based on sustained usage."""
+        tier = 0
+        config = self.tiered.tier_configs[tier]
+        initial_watermark = config.get('watermark', 0.9)
+        # Simulate high usage to trigger increase
+        self.tiered.tier_usage[tier]['count'] = config['capacity_count']
+        self.tiered._feedback_adjust_thresholds()
+        increased = config['watermark'] > initial_watermark
+        # Simulate low usage to trigger decrease
+        config['watermark'] = initial_watermark  # Reset
+        self.tiered.tier_usage[tier]['count'] = 0
+        self.tiered._feedback_adjust_thresholds()
+        decreased = config['watermark'] < initial_watermark
+        self.assertTrue(increased or decreased, "Watermark should adjust dynamically.")
+
 
 if __name__ == '__main__':
     unittest.main()

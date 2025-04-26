@@ -504,30 +504,62 @@ class TieredBackend(StorageBackend):
 
     def _feedback_adjust_thresholds(self):
         """
-        Adjust promotion/demotion thresholds and watermarks based on recent metrics.
+        Adjust promotion/demotion thresholds and watermarks based on recent metrics and usage.
+        - Promotion threshold: Adjust based on hit rate (existing logic).
+        - Demotion threshold: Adjust based on demotion/eviction rate and usage.
+        - Watermark: Adjust based on tier usage relative to capacity.
         Log adjustments and export metrics for Prometheus/Grafana.
         """
         for tier_idx, metrics in self.metrics.items():
+            config = self.tier_configs[tier_idx]
+            usage = self.tier_usage[tier_idx]
+            tier_name = config.get('name', f'tier_{tier_idx}')
+            capacity_count = config.get('capacity_count', float('inf'))
+            # --- Promotion threshold adjustment (existing logic) ---
             hit_rate = metrics['hits'] / max(1, (metrics['hits'] + metrics['misses']))
-            old_promo = self.tier_configs[tier_idx]['promotion_threshold']
-            # Example heuristic:
+            old_promo = config['promotion_threshold']
             if hit_rate < 0.7:
-                # Lower promotion threshold (promote more aggressively)
-                self.tier_configs[tier_idx]['promotion_threshold'] = max(
-                    1, self.tier_configs[tier_idx]['promotion_threshold'] - 1
-                )
+                config['promotion_threshold'] = max(1, config['promotion_threshold'] - 1)
             elif hit_rate > 0.95:
-                # Raise promotion threshold (be more selective)
-                self.tier_configs[tier_idx]['promotion_threshold'] += 1
-            # Similar logic for demotion_threshold and watermark can be added here
-            new_promo = self.tier_configs[tier_idx]['promotion_threshold']
-            new_demotion = self.tier_configs[tier_idx].get('demotion_threshold', 1) # Assuming we add this
+                config['promotion_threshold'] += 1
+            new_promo = config['promotion_threshold']
             if new_promo != old_promo:
                 self.logger.info(f"[Tier {tier_idx}] Adjusted promotion_threshold: {old_promo} -> {new_promo} (hit_rate={hit_rate:.2f})")
-            # Update Prometheus Gauges for thresholds
-            tier_name = self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')
             self._prom_promo_threshold.labels(tier_name=tier_name).set(new_promo)
+
+            # --- Demotion threshold adjustment (new logic) ---
+            old_demotion = config.get('demotion_threshold', 1)
+            demotion_rate = metrics['demotions'] / max(1, (metrics['demotions'] + metrics['evictions']))
+            usage_ratio = usage['count'] / max(1, capacity_count)
+            # Heuristic: If usage is high and demotions frequent, lower threshold; if low, raise it
+            if usage_ratio > 0.9 or demotion_rate > 0.7:
+                config['demotion_threshold'] = max(1, old_demotion - 1)
+            elif usage_ratio < 0.5 and demotion_rate < 0.2:
+                config['demotion_threshold'] = old_demotion + 1
+            new_demotion = config['demotion_threshold']
+            if new_demotion != old_demotion:
+                self.logger.info(f"[Tier {tier_idx}] Adjusted demotion_threshold: {old_demotion} -> {new_demotion} (usage_ratio={usage_ratio:.2f}, demotion_rate={demotion_rate:.2f})")
             self._prom_demotion_threshold.labels(tier_name=tier_name).set(new_demotion)
+
+            # --- Watermark adjustment (new logic) ---
+            old_watermark = config.get('watermark', 0.9)
+            # Only adjust if watermark is present in config
+            if 'watermark' in config:
+                # If usage is consistently above watermark, increase it (up to 0.99)
+                if usage_ratio > old_watermark:
+                    config['watermark'] = min(0.99, old_watermark + 0.01)
+                # If usage is well below watermark, decrease it (down to 0.1)
+                elif usage_ratio < old_watermark - 0.1:
+                    config['watermark'] = max(0.1, old_watermark - 0.01)
+                new_watermark = config['watermark']
+                if new_watermark != old_watermark:
+                    self.logger.info(f"[Tier {tier_idx}] Adjusted watermark: {old_watermark:.2f} -> {new_watermark:.2f} (usage_ratio={usage_ratio:.2f})")
+                # Optionally, expose watermark as a Prometheus Gauge (add if not present)
+                if not hasattr(self, '_prom_watermark'):
+                    from prometheus_client import Gauge
+                    self._prom_watermark = Gauge('vua_tier_watermark', 'Current watermark for a tier', self._prom_labels)
+                self._prom_watermark.labels(tier_name=tier_name).set(new_watermark)
+
             # Reset metrics or use rolling window
             metrics['hits'] = 0
             metrics['misses'] = 0

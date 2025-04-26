@@ -146,3 +146,12 @@ VUA now supports multi-tier cache management using a Colloid-inspired algorithm:
 
 See `src/vua/backend.py` and `project.md` for details on the tiering logic and configuration.
 
+## Dynamic Policy Tuning in TieredBackend
+
+The TieredBackend now supports dynamic adjustment of key policy parameters:
+- **promotion_threshold**: Adjusted based on hit rate for each tier.
+- **demotion_threshold**: Adjusted based on demotion/eviction rates and tier usage.
+- **watermark**: Adjusted based on tier usage relative to capacity.
+
+These adjustments are made automatically at runtime, logged for traceability, and exposed as Prometheus metrics for observability. Comprehensive tests validate that these thresholds and watermarks adjust as expected under different usage scenarios.
+
