@@ -10,6 +10,11 @@ try:
 except ImportError:
     pmemobj = None
     logging.warning("PMDK Python binding (pmemobj) not found. Real PMDKBackend will not be functional.")
+    # Try importing a potential base error class
+    try:
+        from pmemobj import Error as PmemError
+    except ImportError:
+        PmemError = None # Fallback if no specific base error exists
 
 # Attempt to import prometheus_client conditionally
 try:
@@ -33,7 +38,7 @@ class StorageBackend(ABC):
     Defines the interface for storing and retrieving cache fragments.
     """
     @abstractmethod
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+    def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
         """
         Store a cache fragment identified by group_hash.
         Args:
@@ -44,7 +49,7 @@ class StorageBackend(ABC):
         pass
 
     @abstractmethod
-    def get(self, group_hash: str) -> Optional[tuple]:
+    def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         """
         Retrieve a cache fragment by group_hash.
         Returns:
@@ -67,7 +72,7 @@ class FileSystemBackend(StorageBackend):
     def __init__(self, root_path: str):
         self.root_path = root_path
 
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+    def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
         """
         Store data and tokens as files in a directory named by group_hash under root_path.
         Args:
@@ -84,7 +89,7 @@ class FileSystemBackend(StorageBackend):
         with open(tokens_path, "wb") as f:
             f.write(tokens)
 
-    def get(self, group_hash: str) -> Optional[tuple]:
+    def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         """
         Retrieve data and tokens from files in the group_hash directory.
         Returns (data_bytes, tokens_bytes) if found, else None.
@@ -118,10 +123,10 @@ class MockPMDKBackend(StorageBackend):
     def __init__(self):
         self._store = {}
 
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+    def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
         self._store[group_hash] = (data, tokens)
 
-    def get(self, group_hash: str) -> Optional[tuple]:
+    def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         return self._store.get(group_hash)
 
     def exists(self, group_hash: str) -> bool:
@@ -134,10 +139,10 @@ class MockGPURAMBackend(StorageBackend):
     def __init__(self):
         self._store = {}
 
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+    def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
         self._store[group_hash] = (data, tokens)
 
-    def get(self, group_hash: str) -> Optional[tuple]:
+    def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         return self._store.get(group_hash)
 
     def exists(self, group_hash: str) -> bool:
@@ -166,6 +171,7 @@ class PMDKBackend(StorageBackend):
         self.pool_path = pool_path
         self.pool_size = pool_size
         self.pool = None
+        self.logger = logging.getLogger(f"PMDKBackend({pool_path})")
 
         try:
             if os.path.exists(pool_path):
@@ -178,14 +184,25 @@ class PMDKBackend(StorageBackend):
                 with self.pool.transaction():
                     self.pool.root = pmemobj.PersistentDict()
             else:
+                # Raise explicitly if pool not found and create=False
                 raise FileNotFoundError(f"PMDK pool file not found and create=False: {pool_path}")
-        except Exception as e:
+        except FileNotFoundError as e: # Catch specific error
+            self.logger.error(f"PMDK pool file not found: {e}")
+            raise
+        except PermissionError as e: # Catch specific error
+            self.logger.error(f"Permission denied for PMDK pool at {pool_path}: {e}")
+            raise
+        except FileExistsError as e: # Catch specific error (less likely here, maybe with create=True?)
+            self.logger.error(f"PMDK pool file unexpectedly exists: {e}")
+            raise
+        except OSError as e: # Catch other OS-level errors
+            self.logger.error(f"OS error during PMDK pool open/create at {pool_path}: {e}")
+            raise
+        except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
             self.logger.error(f"Failed to open or create PMDK pool at {pool_path}: {e}")
             raise
 
-        self.logger = logging.getLogger(f"PMDKBackend({pool_path})")
-
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+    def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
         """
         Store data and tokens persistently in the PMDK pool.
         Uses a transaction for atomicity.
@@ -202,12 +219,16 @@ class PMDKBackend(StorageBackend):
                 persistent_tokens = pmemobj.PersistentBytes(tokens)
                 # Store in the root persistent dictionary
                 self.pool.root[group_hash] = (persistent_data, persistent_tokens)
-        except Exception as e:
+        except MemoryError as e: # Catch potential out-of-space
+            self.logger.error(f"Out of memory in PMDK pool while putting {group_hash}: {e}")
+            # TODO: More specific handling if needed (e.g., trigger eviction?)
+            raise
+        except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
             self.logger.error(f"Failed to put {group_hash} into PMDK pool: {e}")
-            # TODO: Handle specific PMDK errors (e.g., out of space)
+            # TODO: Handle specific PMDK transaction errors?
             raise
 
-    def get(self, group_hash: str) -> Optional[tuple]:
+    def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         """
         Retrieve data and tokens from the PMDK pool.
         Returns a tuple of (bytes, bytes) or None if not found.
@@ -224,9 +245,8 @@ class PMDKBackend(StorageBackend):
                 return (data_bytes, tokens_bytes)
             else:
                 return None
-        except Exception as e:
+        except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
             self.logger.error(f"Failed to get {group_hash} from PMDK pool: {e}")
-            # TODO: Handle specific PMDK errors
             raise
 
     def exists(self, group_hash: str) -> bool:
@@ -238,9 +258,8 @@ class PMDKBackend(StorageBackend):
 
         try:
             return group_hash in self.pool.root
-        except Exception as e:
+        except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
             self.logger.error(f"Failed to check existence of {group_hash} in PMDK pool: {e}")
-            # TODO: Handle specific PMDK errors
             raise
 
     def close(self):
@@ -251,7 +270,7 @@ class PMDKBackend(StorageBackend):
             try:
                 self.pool.close()
                 self.logger.info(f"Closed PMDK pool: {self.pool_path}")
-            except Exception as e:
+            except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
                 self.logger.error(f"Error closing PMDK pool {self.pool_path}: {e}")
             finally:
                 self.pool = None
@@ -322,7 +341,7 @@ class TieredBackend(StorageBackend):
             self._prom_advanced_active.labels(**labels).set(0)
             self._prom_avg_eviction_score.labels(**labels).set(0)
 
-    def get(self, group_hash: str) -> Optional[tuple]:
+    def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         self.op_count += 1
         for tier_idx, backend in enumerate(self.backends):
             result = backend.get(group_hash)
@@ -350,7 +369,7 @@ class TieredBackend(StorageBackend):
             self._feedback_adjust_thresholds()
         return None
 
-    def put(self, group_hash: str, data: Any, tokens: Any) -> None:
+    def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
         self.op_count += 1
         tier_idx = 0
         config = self.tier_configs[tier_idx]
@@ -380,7 +399,14 @@ class TieredBackend(StorageBackend):
 
     def _demote(self, group_hash, from_tier, to_tier):
         meta = self.metadata[group_hash]
-        data, tokens = self.backends[from_tier].get(group_hash)
+        result = self.backends[from_tier].get(group_hash)
+        if result is None: # Should not happen if metadata exists, but handle defensively
+            self.logger.warning(f"Attempted to demote non-existent {group_hash} from tier {from_tier}")
+            # Clean up potentially inconsistent metadata if needed
+            if group_hash in self.metadata:
+                 del self.metadata[group_hash]
+            return
+        data, tokens = result
         size_bytes = meta['size_bytes']
         if to_tier >= len(self.backends):
             # Evict from system
@@ -426,7 +452,13 @@ class TieredBackend(StorageBackend):
 
     def _promote(self, group_hash, from_tier, to_tier):
         meta = self.metadata[group_hash]
-        data, tokens = self.backends[from_tier].get(group_hash)
+        result = self.backends[from_tier].get(group_hash)
+        if result is None: # Should not happen, handle defensively
+             self.logger.warning(f"Attempted to promote non-existent {group_hash} from tier {from_tier}")
+             if group_hash in self.metadata:
+                 del self.metadata[group_hash]
+             return
+        data, tokens = result
         size_bytes = meta['size_bytes']
         if to_tier >= len(self.backends):
             # Evict from system
