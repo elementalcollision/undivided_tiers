@@ -1097,3 +1097,14 @@ class TieredBackend(StorageBackend):
             10.0 / (meta.get('access_count', 0) + 1) + # LFU component (inverted)
             0.001 * meta.get('size_bytes', 0) # Size component
         ) 
+
+    def exists(self, group_hash: str) -> bool:
+        """Check if a fragment exists in any tier."""
+        for tier_idx, backend in enumerate(self.backends):
+            if backend.exists(group_hash):
+                self.logger.debug(f"Exists check: Found {group_hash} in tier {tier_idx}")
+                # Optionally update metadata if found in a lower tier?
+                # For now, just return True
+                return True
+        self.logger.debug(f"Exists check: {group_hash} not found in any tier.")
+        return False 
