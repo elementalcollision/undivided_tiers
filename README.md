@@ -142,6 +142,7 @@ VUA now supports multi-tier cache management using a Colloid-inspired algorithm:
 - Promotion, demotion, and eviction policies are based on access frequency, recency, and dynamic thresholds.
 - Metadata is tracked for each cache fragment, with advanced heuristics activated as cache fills.
 - The system adapts to access patterns and tier pressure, keeping hot data in the fastest available memory.
+- **Metrics:** Key performance indicators (hits, misses, promotions, demotions, evictions, tier usage) and aggregated statistics (distributions of fragment age, access count, size) are exported for monitoring via Prometheus (requires optional `prometheus-client` dependency).
 
 See `src/vua/backend.py` and `project.md` for details on the tiering logic and configuration.
 

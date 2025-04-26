@@ -11,6 +11,21 @@ except ImportError:
     pmemobj = None
     logging.warning("PMDK Python binding (pmemobj) not found. Real PMDKBackend will not be functional.")
 
+# Attempt to import prometheus_client conditionally
+try:
+    from prometheus_client import Counter, Gauge, start_http_server, Histogram, Summary
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+    logging.warning("prometheus-client not found. Prometheus metrics export will not be available.")
+    # Define dummy classes if not available, so code doesn't break
+    class DummyMetric:
+        def labels(self, *args, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def set(self, *args, **kwargs): pass
+    Counter = Gauge = DummyMetric
+    Histogram = Summary = DummyMetric
+
 # Restored Class Definitions
 class StorageBackend(ABC):
     """
@@ -248,7 +263,7 @@ class PMDKBackend(StorageBackend):
 # TieredBackend follows
 
 class TieredBackend(StorageBackend):
-    def __init__(self, backends, tier_configs, advanced_watermark=0.9):
+    def __init__(self, backends, tier_configs, advanced_watermark=0.9, adjustment_interval=1000):
         self.backends = backends
         self.tier_configs = tier_configs
         self.advanced_watermark = advanced_watermark
@@ -264,9 +279,48 @@ class TieredBackend(StorageBackend):
             }
             for i in range(len(backends))
         }
-        self.adjustment_interval = 1000  # Number of ops between adjustments
+        self.adjustment_interval = adjustment_interval
         self.op_count = 0
         self.logger = logging.getLogger("TieredBackend")
+
+        # --- Prometheus Metrics Definition ---
+        self._prom_labels = ['tier_name']
+        self._prom_hits = Counter('vua_tier_hits_total', 'Total cache hits for a tier', self._prom_labels)
+        self._prom_misses = Counter('vua_tier_misses_total', 'Total cache misses for a tier', self._prom_labels)
+        self._prom_promotions = Counter('vua_tier_promotions_total', 'Total promotions from a tier', self._prom_labels)
+        self._prom_demotions = Counter('vua_tier_demotions_total', 'Total demotions from a tier', self._prom_labels)
+        self._prom_evictions = Counter('vua_tier_evictions_total', 'Total evictions from a tier', self._prom_labels)
+        self._prom_usage_count = Gauge('vua_tier_usage_fragments', 'Current fragment count in a tier', self._prom_labels)
+        self._prom_usage_bytes = Gauge('vua_tier_usage_bytes', 'Current byte usage in a tier', self._prom_labels)
+        self._prom_capacity_count = Gauge('vua_tier_capacity_fragments', 'Fragment capacity of a tier', self._prom_labels)
+        self._prom_capacity_bytes = Gauge('vua_tier_capacity_bytes', 'Byte capacity of a tier', self._prom_labels)
+        self._prom_promo_threshold = Gauge('vua_tier_promotion_threshold', 'Current promotion threshold for a tier', self._prom_labels)
+        self._prom_demotion_threshold = Gauge('vua_tier_demotion_threshold', 'Current demotion threshold for a tier', self._prom_labels)
+
+        # --- New Aggregated/Distribution Metrics ---
+        # Using Histogram for distributions - define buckets appropriately
+        age_buckets = (1, 5, 15, 60, 300, 1800, 3600, float('inf')) # seconds
+        count_buckets = (1, 2, 5, 10, 25, 100, float('inf'))
+        size_buckets = (1024, 4096, 16384, 65536, 262144, 1048576, float('inf')) # bytes
+
+        self._prom_frag_age = Histogram('vua_tier_fragment_age_seconds', 'Distribution of fragment ages per tier (last access)', self._prom_labels, buckets=age_buckets)
+        self._prom_frag_access_count = Histogram('vua_tier_fragment_access_count', 'Distribution of fragment access counts per tier', self._prom_labels, buckets=count_buckets)
+        self._prom_frag_size = Histogram('vua_tier_fragment_size_bytes', 'Distribution of fragment sizes per tier', self._prom_labels, buckets=size_buckets)
+        self._prom_advanced_active = Gauge('vua_tier_advanced_metadata_active_fragments', 'Number of fragments using advanced metadata per tier', self._prom_labels)
+        self._prom_avg_eviction_score = Gauge('vua_tier_avg_eviction_score', 'Average eviction score per tier', self._prom_labels)
+
+        # Initialize gauges for configured capacities and initial thresholds
+        for i, config in enumerate(self.tier_configs):
+            tier_name = config.get('name', f'tier_{i}')
+            labels = {'tier_name': tier_name}
+            self._prom_capacity_count.labels(**labels).set(config.get('capacity_count', float('inf')))
+            self._prom_capacity_bytes.labels(**labels).set(config.get('capacity_bytes', float('inf')))
+            self._prom_promo_threshold.labels(**labels).set(config.get('promotion_threshold', 1))
+            self._prom_demotion_threshold.labels(**labels).set(config.get('demotion_threshold', 1))
+            self._prom_usage_count.labels(**labels).set(0)
+            self._prom_usage_bytes.labels(**labels).set(0)
+            self._prom_advanced_active.labels(**labels).set(0)
+            self._prom_avg_eviction_score.labels(**labels).set(0)
 
     def get(self, group_hash: str) -> Optional[tuple]:
         self.op_count += 1
@@ -278,16 +332,20 @@ class TieredBackend(StorageBackend):
                     size_bytes = self.metadata[group_hash].get('size_bytes', None)
                 meta = self._update_metadata(group_hash, tier_idx, size_bytes or 0, access=True)
                 self.metrics[tier_idx]['hits'] += 1
+                self._prom_hits.labels(tier_name=self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')).inc()
                 # Promotion logic
                 if tier_idx > 0 and meta['access_count'] >= meta.get('promotion_threshold', 1):
                     if self._can_promote(group_hash, tier_idx, tier_idx - 1):
+                        promo_tier_name = self.tier_configs[tier_idx - 1].get('name', f'tier_{tier_idx - 1}')
                         self._promote(group_hash, tier_idx, tier_idx - 1)
                         self.metrics[tier_idx]['promotions'] += 1
+                        self._prom_promotions.labels(tier_name=promo_tier_name).inc() # Count promotion *into* the tier
                 if self.op_count % self.adjustment_interval == 0:
                     self._feedback_adjust_thresholds()
                 return result
             else:
                 self.metrics[tier_idx]['misses'] += 1
+                self._prom_misses.labels(tier_name=self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')).inc()
         if self.op_count % self.adjustment_interval == 0:
             self._feedback_adjust_thresholds()
         return None
@@ -310,9 +368,12 @@ class TieredBackend(StorageBackend):
                 break
             self._demote(victim, tier_idx, tier_idx + 1)
             self.metrics[tier_idx]['demotions'] += 1
+            self._prom_demotions.labels(tier_name=self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')).inc()
         self.backends[tier_idx].put(group_hash, data, tokens)
         usage['count'] += 1
         usage['bytes'] += size_bytes
+        self._prom_usage_count.labels(tier_name=self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')).set(usage['count'])
+        self._prom_usage_bytes.labels(tier_name=self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')).set(usage['bytes'])
         self._update_metadata(group_hash, tier_idx, size_bytes, access=False)
         if self.op_count % self.adjustment_interval == 0:
             self._feedback_adjust_thresholds()
@@ -328,6 +389,10 @@ class TieredBackend(StorageBackend):
             self.tier_usage[from_tier]['bytes'] -= size_bytes
             del self.metadata[group_hash]
             self.metrics[from_tier]['evictions'] += 1
+            self._prom_evictions.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).inc()
+            # Update Prometheus Gauges for usage
+            self._prom_usage_count.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['count'])
+            self._prom_usage_bytes.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['bytes'])
             return
         # Check if to_tier is full, recursively demote
         config = self.tier_configs[to_tier]
@@ -341,6 +406,7 @@ class TieredBackend(StorageBackend):
                 break
             self._demote(victim, to_tier, to_tier + 1)
             self.metrics[to_tier]['demotions'] += 1
+            self._prom_demotions.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).inc()
         # Move to new tier
         self.backends[to_tier].put(group_hash, data, tokens)
         self.backends[from_tier].put(group_hash, b"", b"")
@@ -348,10 +414,61 @@ class TieredBackend(StorageBackend):
         self.tier_usage[from_tier]['bytes'] -= size_bytes
         self.tier_usage[to_tier]['count'] += 1
         self.tier_usage[to_tier]['bytes'] += size_bytes
+        # Update Prometheus Gauges for usage
+        self._prom_usage_count.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['count'])
+        self._prom_usage_bytes.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['bytes'])
+        self._prom_usage_count.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).set(self.tier_usage[to_tier]['count'])
+        self._prom_usage_bytes.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).set(self.tier_usage[to_tier]['bytes'])
         meta['tier'] = to_tier
         meta['access_count'] = 0
         meta['last_access'] = time.time()
         self.metrics[to_tier]['demotions'] += 1
+
+    def _promote(self, group_hash, from_tier, to_tier):
+        meta = self.metadata[group_hash]
+        data, tokens = self.backends[from_tier].get(group_hash)
+        size_bytes = meta['size_bytes']
+        if to_tier >= len(self.backends):
+            # Evict from system
+            self.backends[from_tier].put(group_hash, b"", b"")
+            self.tier_usage[from_tier]['count'] -= 1
+            self.tier_usage[from_tier]['bytes'] -= size_bytes
+            del self.metadata[group_hash]
+            self.metrics[from_tier]['evictions'] += 1
+            self._prom_evictions.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).inc()
+            # Update Prometheus Gauges for usage
+            self._prom_usage_count.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['count'])
+            self._prom_usage_bytes.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['bytes'])
+            return
+        # Check if to_tier is full, recursively promote
+        config = self.tier_configs[to_tier]
+        usage = self.tier_usage[to_tier]
+        while (
+            (config.get('capacity_count') and usage['count'] >= config['capacity_count']) or
+            (config.get('capacity_bytes') and usage['bytes'] + size_bytes > config['capacity_bytes'])
+        ):
+            victim = self._find_coldest_fragment(to_tier)
+            if victim is None:
+                break
+            self._promote(victim, to_tier, to_tier + 1)
+            self.metrics[to_tier]['promotions'] += 1
+            self._prom_promotions.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).inc()
+        # Move to new tier
+        self.backends[to_tier].put(group_hash, data, tokens)
+        self.backends[from_tier].put(group_hash, b"", b"")
+        self.tier_usage[from_tier]['count'] -= 1
+        self.tier_usage[from_tier]['bytes'] -= size_bytes
+        self.tier_usage[to_tier]['count'] += 1
+        self.tier_usage[to_tier]['bytes'] += size_bytes
+        # Update Prometheus Gauges for usage
+        self._prom_usage_count.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['count'])
+        self._prom_usage_bytes.labels(tier_name=self.tier_configs[from_tier].get('name', f'tier_{from_tier}')).set(self.tier_usage[from_tier]['bytes'])
+        self._prom_usage_count.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).set(self.tier_usage[to_tier]['count'])
+        self._prom_usage_bytes.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).set(self.tier_usage[to_tier]['bytes'])
+        meta['tier'] = to_tier
+        meta['access_count'] = 0
+        meta['last_access'] = time.time()
+        self.metrics[to_tier]['promotions'] += 1
 
     def _feedback_adjust_thresholds(self):
         """
@@ -372,8 +489,13 @@ class TieredBackend(StorageBackend):
                 self.tier_configs[tier_idx]['promotion_threshold'] += 1
             # Similar logic for demotion_threshold and watermark can be added here
             new_promo = self.tier_configs[tier_idx]['promotion_threshold']
+            new_demotion = self.tier_configs[tier_idx].get('demotion_threshold', 1) # Assuming we add this
             if new_promo != old_promo:
                 self.logger.info(f"[Tier {tier_idx}] Adjusted promotion_threshold: {old_promo} -> {new_promo} (hit_rate={hit_rate:.2f})")
+            # Update Prometheus Gauges for thresholds
+            tier_name = self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')
+            self._prom_promo_threshold.labels(tier_name=tier_name).set(new_promo)
+            self._prom_demotion_threshold.labels(tier_name=tier_name).set(new_demotion)
             # Reset metrics or use rolling window
             metrics['hits'] = 0
             metrics['misses'] = 0
@@ -381,14 +503,119 @@ class TieredBackend(StorageBackend):
             metrics['demotions'] = 0
             metrics['evictions'] = 0
         # Export metrics for Prometheus/Grafana
-        self.export_metrics()
+        self.export_metrics() # This now mainly updates gauges
 
     def export_metrics(self):
         """
-        Export current metrics for Prometheus/Grafana integration.
-        This is a stub; in production, use a library like prometheus_client to expose metrics.
+        Ensure Prometheus Gauges and Histograms/Summaries are up-to-date.
+        Calculates aggregated stats from self.metadata.
+        Counters are updated directly in relevant methods.
         """
-        # Example: print metrics (replace with Prometheus push or HTTP endpoint)
-        for tier_idx, metrics in self.metrics.items():
-            self.logger.info(f"[Tier {tier_idx}] Metrics: {metrics}")
-        # TODO: Integrate with prometheus_client or another metrics exporter 
+        now = time.time()
+        # Temporary storage for per-tier aggregates
+        tier_aggregates = {
+            i: {'advanced_count': 0, 'total_score': 0.0, 'fragment_count': 0}
+            for i in range(len(self.backends))
+        }
+        # Clear histograms before recalculating - Prometheus client handles aggregation across scrapes
+        # Note: This might not be the most efficient way for histograms if updates are frequent.
+        # Consider updating histograms more incrementally if performance is an issue.
+        for i, config in enumerate(self.tier_configs):
+             tier_name = config.get('name', f'tier_{i}')
+             labels = {'tier_name': tier_name}
+             self._prom_frag_age.labels(**labels)._metric.reset()
+             self._prom_frag_access_count.labels(**labels)._metric.reset()
+             self._prom_frag_size.labels(**labels)._metric.reset()
+
+        # Iterate through all fragments to populate histograms and aggregates
+        for group_hash, meta in self.metadata.items():
+            tier_idx = meta['tier']
+            tier_name = self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')
+            labels = {'tier_name': tier_name}
+
+            # Observe distributions
+            age = now - meta.get('last_access', meta.get('insert_time', 0))
+            self._prom_frag_age.labels(**labels).observe(age)
+            self._prom_frag_access_count.labels(**labels).observe(meta.get('access_count', 0))
+            self._prom_frag_size.labels(**labels).observe(meta.get('size_bytes', 0))
+
+            # Update aggregates
+            aggregates = tier_aggregates[tier_idx]
+            aggregates['fragment_count'] += 1
+            if 'history' in meta: # Check if advanced metadata is active
+                aggregates['advanced_count'] += 1
+            aggregates['total_score'] += self._calculate_eviction_score(meta)
+
+        # Update Gauges with final aggregates
+        for tier_idx, config in enumerate(self.tier_configs):
+            tier_name = config.get('name', f'tier_{tier_idx}')
+            usage = self.tier_usage[tier_idx]
+            aggregates = tier_aggregates[tier_idx]
+            labels = {'tier_name': tier_name}
+
+            self._prom_usage_count.labels(**labels).set(usage['count'])
+            self._prom_usage_bytes.labels(**labels).set(usage['bytes'])
+            self._prom_promo_threshold.labels(**labels).set(config.get('promotion_threshold', 1))
+            self._prom_demotion_threshold.labels(**labels).set(config.get('demotion_threshold', 1))
+            self._prom_advanced_active.labels(**labels).set(aggregates['advanced_count'])
+            avg_score = aggregates['total_score'] / max(1, aggregates['fragment_count'])
+            self._prom_avg_eviction_score.labels(**labels).set(avg_score)
+
+        self.logger.debug("Prometheus metrics gauges and histograms updated.")
+        # The actual export happens via an HTTP server started elsewhere
+
+    # Method to start the HTTP server (optional, can be called by application)
+    def start_prometheus_server(self, port=8000):
+        if PROMETHEUS_AVAILABLE:
+            try:
+                start_http_server(port)
+                self.logger.info(f"Prometheus metrics server started on port {port}")
+            except Exception as e:
+                self.logger.error(f"Failed to start Prometheus server on port {port}: {e}")
+        else:
+            self.logger.warning("Cannot start Prometheus server: prometheus-client library not available.")
+
+    def _update_metadata(self, group_hash, tier_idx, size_bytes, access):
+        # Implementation of _update_metadata method
+        pass
+
+    def _find_coldest_fragment(self, tier_idx):
+        # Implementation of _find_coldest_fragment method
+        pass
+
+    def _proactive_demote(self, tier_idx):
+        # Implementation of _proactive_demote method
+        pass
+
+    def _can_promote(self, group_hash, from_tier, to_tier):
+        # Implementation of _can_promote method
+        pass
+
+    def _promote(self, group_hash, from_tier, to_tier):
+        # Implementation of _promote method
+        pass
+
+    def _demote(self, group_hash, from_tier, to_tier):
+        # Implementation of _demote method
+        pass
+
+    def _feedback_adjust_thresholds(self):
+        # Implementation of _feedback_adjust_thresholds method
+        pass
+
+    def export_metrics(self):
+        # Implementation of export_metrics method
+        pass
+
+    def start_prometheus_server(self, port):
+        # Implementation of start_prometheus_server method
+        pass
+
+    def _calculate_eviction_score(self, meta):
+        """Helper to calculate eviction score based on current policy."""
+        # Example simple score - replace with actual logic if needed
+        return (
+            (time.time() - meta.get('last_access', meta.get('insert_time', 0))) + # LRU component
+            10.0 / (meta.get('access_count', 0) + 1) + # LFU component (inverted)
+            0.001 * meta.get('size_bytes', 0) # Size component
+        ) 

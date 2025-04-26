@@ -65,6 +65,11 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
     - Updated README and codebase to reflect new backend and tiering structure.
 - [ ] Test and validate
 - [ ] Document and release
+- Refactoring of `PMDKBackend` will proceed next.
+  - Refactored `PMDKBackend` to use the `pmemobj` Python binding.
+  - Implemented pool creation/opening, persistent dictionary for storage, and transactional puts.
+  - Added `close()` method and basic error handling.
+  - TODOs remain for specific PMDK error handling (e.g., OOM) and require testing on actual PMEM/CXL hardware.
 
 ## Colloid-Inspired Tiering Algorithm Outline
 
@@ -158,4 +163,45 @@ Prototyping of this logic will begin next.
 
 ---
 
-Research and code generation for dynamic policy tuning will proceed next. 
+Research and code generation for dynamic policy tuning will proceed next.
+
+## Next Steps: Real PMDK Integration
+
+### Objectives
+- Replace the simulated file-based logic in `src/vua/backend.py::PMDKBackend` with calls to a real PMDK Python binding (likely `py-pmemobj`).
+- Implement PMDK pool creation/opening (`pmemobj_create`/`pmemobj_open`) in the backend's constructor.
+- Utilize persistent memory allocation (e.g., `pmemobj_alloc`) and transactional updates within the PMDK pool for `put`, `get`, and `exists` operations, using the `group_hash` as a key.
+- Add robust error handling for PMDK-specific issues (pool errors, allocation failures).
+- Ensure the implementation remains modular, encapsulating PMDK specifics within `PMDKBackend` and adhering to the `StorageBackend` interface, allowing for potential future integration of other CXL SDKs via separate backend classes.
+- Add necessary configuration options (pool path, size, layout name) for the `PMDKBackend`.
+
+---
+
+Refactoring of `PMDKBackend` will proceed next.
+
+## Next Steps: Prometheus Integration for Metrics
+
+### Objectives
+- Export key TieredBackend metrics (hits, misses, promotions, demotions, evictions, tier usage, dynamic thresholds) to Prometheus.
+- Enable real-time monitoring and offline analysis of cache performance and policy effectiveness.
+
+### Approach
+- Utilize the `prometheus-client` Python library.
+- Define Prometheus Counters and Gauges within `TieredBackend`, labeled by tier, for aggregated metrics (hits, misses, usage, thresholds, etc.).
+- Define Prometheus `Histogram` or `Summary` metrics to track distributions of key per-fragment metadata (e.g., fragment age, access counts, size) per tier.
+- Calculate and update aggregated/distribution metrics periodically.
+- Update metrics within relevant backend methods.
+- Expose metrics via an optional HTTP endpoint for Prometheus scraping.
+- **Note:** Avoid exporting raw per-fragment metadata directly to Prometheus due to cardinality concerns; use aggregated statistics and distributions instead.
+
+### Implementation Steps
+1. Add `prometheus-client` as an optional dependency.
+2. Define Prometheus metric objects (Counters, Gauges, Histograms/Summaries) in `TieredBackend` constructor.
+3. Increment/set counters and basic gauges in relevant backend methods.
+4. Implemented logic to calculate and update aggregated/distribution metrics (Histograms/Summaries, advanced metadata counts, avg scores) periodically (e.g., in `export_metrics`).
+5. Add option to example script to start Prometheus HTTP server.
+6. Update documentation.
+
+---
+
+Implementation of Prometheus integration (including aggregated metrics) is complete. 
