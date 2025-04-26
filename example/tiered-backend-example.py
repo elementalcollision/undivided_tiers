@@ -38,6 +38,7 @@ def main():
     parser.add_argument("--pmdk-path", default=None, help="Path for PMDK pool file (used if 'pmdk' is selected for any tier)")
     parser.add_argument("--pmdk-size", type=int, default=1024*1024*100, help="Size (bytes) for PMDK pool creation") # 100MB default
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Set logging level")
+    parser.add_argument("--prometheus-port", type=int, default=None, help="Port to start Prometheus metrics server on (e.g., 8000)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -95,6 +96,13 @@ def main():
         # Instantiate VUA with TieredBackend
         cache = VUA(VUAConfig, temp_dir, backend=tiered_backend)
 
+        # Start Prometheus server if requested
+        if args.prometheus_port:
+            if isinstance(tiered_backend, TieredBackend):
+                tiered_backend.start_prometheus_server(args.prometheus_port)
+            else:
+                logging.warning("Prometheus export only available when using TieredBackend.")
+
         logging.info(f"--- Tiered Backend Example ({args.tier0_backend}/{args.tier1_backend}/{args.tier2_backend}) ---")
 
         # Generate sample data
@@ -144,6 +152,15 @@ def main():
         # Expected: frag1 promoted to tier 0, others demoted accordingly
 
         logging.info("--- Example Complete ---")
+
+        # Keep running if Prometheus server is active
+        if args.prometheus_port:
+            logging.info(f"Prometheus server running on port {args.prometheus_port}. Press Ctrl+C to exit.")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                logging.info("Exiting.")
 
 if __name__ == "__main__":
     main() 
