@@ -12,11 +12,14 @@ dependencies = [
     "torch>=2.6.0",
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "accelerate>=1.5.2",
     "bitsandbytes>=0.45.3",
     "transformers>=4.49.0",
+]
+monitoring = [
+    "prometheus-client>=0.14.0",
 ]
 
 [build-system]
