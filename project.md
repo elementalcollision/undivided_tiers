@@ -89,6 +89,30 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
     - Updated code and documentation to reflect these new features.
     - **Comprehensive tests** now validate dynamic adjustment of all thresholds and watermarks (see `tests/test_vua.py`).
     - The `README.md` has been updated to highlight these features for users.
+- [x] **Dynamic Policy Tuning Implementation:**
+    - Integrated LeCAR (Learning Cache Admission and Replacement) policy into `TieredBackend`
+    - Implemented adaptive threshold adjustments based on policy weights
+    - Added policy-based promotion/demotion decisions
+    - Enhanced victim selection using policy scoring
+    - Updated Prometheus metrics to track policy effectiveness
+    - Completed integration of policy feedback loops with threshold adjustments
+- [x] **Policy Configuration Enhancement:**
+    - Added `PolicyConfig` dataclass for structured configuration.
+    - Implemented runtime configuration updates via `update_config` method.
+    - Made policy parameters (learning rate, exploration, weights, TTL) configurable.
+    - Included basic `policy_config_demo.py` example.
+- [x] **Advanced Metrics & Monitoring (Policy Level):**
+    - Added Prometheus metrics for policy weights, ghost cache stats, and exploration.
+    - Implemented score distribution tracking using Histograms.
+    - Integrated policy eviction tracking (`policy.evict`) into `TieredBackend`.
+- [x] **Testing & Validation (LeCAR Unit Tests):**
+    - Created `tests/test_policy.py`.
+    - Implemented unit tests covering initialization, scoring, decisions, victim selection, learning, ghost cache, and configuration updates for `LeCAR`.
+- [x] **Policy Tuning & Optimization (Setup):**
+    - Removed redundant thresholds from `TieredBackend` config.
+    - Made internal policy thresholds (`base_promotion_score_threshold`, `base_demotion_score_threshold`) configurable via `PolicyConfig`.
+    - Refactored `TieredBackend._feedback_adjust_thresholds` to target `PolicyConfig` parameters.
+    - Implemented initial heuristics for tuning exploration rate and score thresholds.
 
 ## Colloid-Inspired Tiering Algorithm Outline
 
@@ -171,18 +195,36 @@ Prototyping of the metadata table and tier management logic will proceed with th
 
 Prototyping of this logic will begin next.
 
-## Next Steps: Dynamic Policy Tuning
+## Next Steps: Dynamic Policy Tuning Refinement
 
-### Objectives
-- Implement feedback loops to dynamically adjust promotion/demotion thresholds and watermarks based on observed metrics (e.g., hit/miss rates, tier pressure, access patterns).
-- Experiment with different scoring functions for eviction and promotion (e.g., weighted LRU/LFU, recency/frequency hybrids).
-- Explore adding a learning or heuristic module to predict hot/cold fragments and adapt policies in real time.
-- Ensure all policy parameters are configurable and, where possible, tunable at runtime.
-- Document the impact of dynamic tuning on cache efficiency and system performance.
+### Current Status
+- Base LeCAR policy implementation complete with configuration and advanced metrics.
+- Unit tests for LeCAR policy logic are in place.
+- Feedback loop mechanism implemented to tune policy parameters.
+
+### Remaining Tasks
+1.  **Policy Tuning & Optimization (Refinement & Benchmarking)**
+    - [ ] **Benchmarking:** Develop scripts/workloads to measure performance impact of different policy configurations and tuning heuristics.
+    - [ ] **Refine Heuristics:** Analyze benchmark results and refine the tuning logic in `_feedback_adjust_thresholds` based on data.
+    - [ ] **Adaptive Exploration (Optional):** Investigate/implement more advanced adaptation for exploration rate.
+    - [ ] **Workload-Specific Tuning (Optional):** Explore methods for detecting and adapting to different workload patterns.
+2.  **Testing & Validation (Integration)**
+    - [ ] Create integration tests for `TieredBackend` with `LeCAR` focusing on the dynamic tuning behavior over time.
+    - [ ] Test edge cases related to tuning (e.g., rapid changes, hitting bounds).
+3.  **Documentation & Examples**
+    - [ ] Document policy configuration options and tuning heuristics.
+    - [ ] Provide example configurations optimized for different scenarios (e.g., high-hit-rate, high-churn).
+    - [ ] Add monitoring/dashboard setup guides for policy-specific metrics.
+    - [ ] Include performance tuning recommendations based on benchmarking.
+
+### Implementation Priority
+1. Policy Tuning & Optimization (Benchmarking first)
+2. Testing & Validation (Integration for tuning)
+3. Documentation & Examples
 
 ---
 
-Research and code generation for dynamic policy tuning will proceed next.
+Development of Benchmarking scripts will proceed next.
 
 ## Next Steps: Real PMDK Integration
 
