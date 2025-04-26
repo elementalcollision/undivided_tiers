@@ -92,8 +92,11 @@ VUA is a system for storing and retrieving key-value caches of deep learning mod
      uv run python ./example/on-transformers.py
      ```
    - Example demonstrating the TieredBackend (`tiered-backend-example.py`)
+     - This example now accepts command-line arguments to configure the backend types (mock_gpu, mock_dram, fs, pmdk) and paths for each tier. Run with `-h` for details.
      ```
      uv run python ./example/tiered-backend-example.py
+     # Example with PMDK for tier 1:
+     # uv run python ./example/tiered-backend-example.py --tier1-backend pmdk --pmdk-path /mnt/pmem/my_pool.pmdk
      ```
    - Usage with experimental vLLM connector (`vllm_kv_connector_0.py`, `serve-vllm.sh`, etc.)
      ```
