@@ -43,10 +43,106 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
 - [CXL Consortium](https://www.computeexpresslink.org/)
 
 ## Progress Log
-- [ ] Draft design doc and create project.md (in progress)
-- [ ] Research PMDK Python integration
-- [ ] Refactor VUA for backend abstraction
-- [ ] Prototype PMDK backend
-- [ ] Implement tiering logic
+- [x] Draft design doc and create project.md (complete)
+- [x] Research PMDK Python integration (in progress)
+    - Investigated available Python bindings for PMDK:
+        - [py-pmemobj](https://github.com/pmem/py-pmemobj): Python bindings for libpmemobj (transactional object store).
+        - [py-pmem](https://github.com/pmem/py-pmem): Python bindings for libpmem (low-level persistent memory support).
+    - Plan: Prototype minimal usage of these bindings (create pool, persist object, read back) and evaluate suitability for VUA backend abstraction.
+    - Will update this log with findings, issues, and next steps as research continues.
+- [x] Refactor VUA for backend abstraction (complete)
+    - The VUA class now accepts a backend parameter and uses the StorageBackend interface for all cache fragment storage and retrieval.
+    - This enables easy swapping between filesystem, mock, and future PMDK backends, and is a foundation for tiering and further enhancements.
+- [x] Prototype PMDK backend (complete)
+    - Implemented PMDKBackend as a simulated backend using a dedicated directory (pmdk_pool) to mimic PMDK pool/object storage.
+    - This allows for development and testing of backend integration and tiering logic without requiring CXL/PMEM hardware.
+    - The class includes TODOs and docstrings for future replacement with real PMDK logic.
+- [x] Implement tiering logic (complete)
+    - Implemented Colloid-inspired tiering logic in TieredBackend, including promotion, demotion, eviction, and proactive demotion based on LRU/LFU and dynamic thresholds.
+    - Added metadata schema and activation logic for advanced fields as cache fills.
+    - Integrated snoop filter and per-tier thresholds.
+    - Wrote comprehensive unit tests for insertion, retrieval, promotion, demotion, and eviction across tiers using mock backends.
+    - Updated README and codebase to reflect new backend and tiering structure.
 - [ ] Test and validate
-- [ ] Document and release 
+- [ ] Document and release
+
+## Colloid-Inspired Tiering Algorithm Outline
+
+### Core Principle
+- Dynamically balance hot (frequently accessed) data across memory tiers (GPU, DRAM, CXL/PMEM, Storage) based on access frequency and estimated latency, minimizing overload and maximizing performance.
+
+### Data Structures
+- Tier Metadata Table: For each cache fragment, track:
+  - Current tier (e.g., GPU, DRAM, PMEM, Storage)
+  - Access count or recency (e.g., LRU, LFU, or custom)
+  - Last access timestamp
+  - Estimated access latency for each tier
+- Tier Capacity/Pressure: Track current usage and capacity for each tier.
+
+### Algorithm Steps
+- **On Access (get):**
+  - Update access count/recency for the fragment.
+  - If in a lower tier and higher tier has capacity, promote fragment.
+  - If higher tier is full, evict/demote coldest fragment, then promote hot fragment.
+- **On Insert (put):**
+  - Place new fragments in highest available tier.
+  - If tier is full, evict/demote coldest fragment.
+- **Eviction Policy:**
+  - Use LRU, LFU, or hybrid. Optionally use latency estimates for prioritization.
+- **Tier Pressure Management:**
+  - Monitor usage/pressure. If overloaded, proactively demote cold fragments.
+
+### Promotion/Demotion Triggers
+- Promotion: On access, if fragment is hot and higher tier is available.
+- Demotion: On insert or when tier is full, evict coldest fragment to next lower tier.
+
+### Metrics and Feedback
+- Track hit/miss rates and access latencies per tier.
+- Optionally use feedback to adjust thresholds dynamically.
+
+### Integration Points
+- Implement in TieredBackend class.
+- Use a metadata table (e.g., Python dict) to track fragment state.
+- Integrate with put, get, and exists methods.
+
+### Tiering Policy Decisions
+- **Capacity Measurement:**
+  - Use both fragment count and bytes to determine if a tier is full.
+  - If explicit limits are not set, query the framework/runtime (e.g., PyTorch for GPU RAM) to determine available memory and set capacity accordingly.
+- **Promotion Policy:**
+  - Promotion requires multiple accesses (not just a single access) to avoid redundant promotions from LLM tokenization patterns.
+- **Demotion Policy:**
+  - Demotion occurs on eviction (when a tier is full and a new fragment must be inserted).
+  - Proactive demotion is also triggered when usage exceeds a tunable watermark (e.g., 90% full).
+- **Thresholds:**
+  - Thresholds are dynamic and adaptive, using heuristics to adjust based on observed access patterns (e.g., hit/miss rates, access frequency distributions).
+
+Prototyping of the metadata table and tier management logic will proceed with these policies.
+
+### Metadata Schema for Tiered Cache Management
+- **Always present:**
+  - `tier`: int — Index of the current tier (0 = fastest, N = slowest)
+  - `access_count`: int — Number of accesses since last promotion/demotion or insertion
+  - `last_access`: float — Timestamp of the last access
+  - `size_bytes`: int — Size of the fragment in bytes (data + tokens)
+  - `insert_time`: float — Timestamp when the fragment was first inserted
+- **Advanced fields (triggered as cache fills):**
+  - `history`: list[float] — Recent access timestamps (for moving average, burst detection, etc.)
+  - `promotion_threshold`: int — Per-tier (default), can be overridden per-fragment if needed
+  - `demotion_threshold`: int — Per-tier (default), can be overridden per-fragment if needed
+  - `latency_estimates`: dict — Estimated access latency for each tier
+  - `eviction_score`: float — Calculated score for fine-grained eviction/promotion
+  - `snoop_filter`: dict — Info about adjacent tiers (capacity, readiness)
+- **Activation:**
+  - Advanced fields are only populated and used when the cache is approaching or exceeding a configurable fill watermark (e.g., 80–90% full).
+  - This enables lightweight operation when the cache is mostly empty, and fine-grained control as pressure increases.
+- **Thresholds:**
+  - Start per-tier (configurable in `tier_configs`).
+  - Allow for future adaptation to per-fragment or global if testing shows benefit.
+- **Snoop Filter:**
+  - Each fragment's metadata (or the tier manager) can query the tier above and below for current usage/capacity and readiness to accept promoted/demoted fragments.
+  - This enables smarter decisions for promotion/demotion.
+
+---
+
+Prototyping of this logic will begin next. 

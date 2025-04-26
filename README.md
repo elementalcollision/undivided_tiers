@@ -81,7 +81,7 @@ VUA is a system for storing and retrieving key-value caches of deep learning mod
 
 6. **Debugging and Logging**
 
-   VUA leverages Python’s `logging` module for detailed debug output. Configure custom log handlers during development to monitor directory navigation and cache operations effectively.
+   VUA leverages Python's `logging` module for detailed debug output. Configure custom log handlers during development to monitor directory navigation and cache operations effectively.
 
 # Repairing Symlinks in the Cache Directory
 
@@ -101,4 +101,23 @@ This script will scan all group directories in the cache, check for missing or b
 VUA is released under the Apache License Version 2.0.
 
 See the file LICENSE for more details.
+
+## File and Directory Structure
+
+- `src/vua/core.py`: Main VUA logic and API
+- `src/vua/serdes.py`: Tensor serialization/deserialization
+- `src/vua/backend.py`: Storage backend abstractions, including FileSystemBackend, PMDKBackend, MockPMDKBackend, and TieredBackend (Colloid-inspired tiering logic)
+- `tests/`: Unit tests for VUA, backends, and tiering
+- `scripts/`: CLI and utility scripts
+- `example/`, `samples/`, `static/`: Usage examples, sample data, and static assets
+
+## Tiered Backend and Colloid-Inspired Tiering
+
+VUA now supports multi-tier cache management using a Colloid-inspired algorithm:
+- Data is managed across multiple tiers (e.g., GPU RAM, DRAM, CXL/PMEM, Storage) using the `TieredBackend` abstraction.
+- Promotion, demotion, and eviction policies are based on access frequency, recency, and dynamic thresholds.
+- Metadata is tracked for each cache fragment, with advanced heuristics activated as cache fills.
+- The system adapts to access patterns and tier pressure, keeping hot data in the fastest available memory.
+
+See `src/vua/backend.py` and `project.md` for details on the tiering logic and configuration.
 

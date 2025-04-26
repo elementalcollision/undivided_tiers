@@ -1,9 +1,12 @@
 import unittest
 import torch
 import logging
+import tempfile
+import shutil
 
 from vua.core import VUA, VUAConfig
 from vua.serdes import tensor_to_bytes, bytes_to_tensor
+from vua.backend import PMDKBackend, TieredBackend, MockPMDKBackend, FileSystemBackend
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
@@ -106,6 +109,102 @@ class TestSerdes(unittest.TestCase):
         x_rec = bytes_to_tensor(b, "tensor")
         self.assertTrue(torch.allclose(x, x_rec.float(), atol=1e-6),
                         "Deserialized tensor does not match the original")
+
+
+class TestPMDKBackend(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.backend = PMDKBackend(self.temp_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_put_and_exists(self):
+        group_hash = "testhash"
+        data = b"testdata"
+        tokens = b"testtokens"
+        self.backend.put(group_hash, data, tokens)
+        self.assertTrue(self.backend.exists(group_hash))
+
+    def test_get_returns_correct_data(self):
+        group_hash = "testhash2"
+        data = b"somedata"
+        tokens = b"sometokens"
+        self.backend.put(group_hash, data, tokens)
+        result = self.backend.get(group_hash)
+        self.assertIsNotNone(result)
+        data_out, tokens_out = result
+        self.assertEqual(data_out, data)
+        self.assertEqual(tokens_out, tokens)
+
+    def test_get_returns_none_for_missing(self):
+        self.assertIsNone(self.backend.get("nonexistent"))
+        self.assertFalse(self.backend.exists("nonexistent"))
+
+
+class TestTieredBackend(unittest.TestCase):
+    def setUp(self):
+        # Use small capacities for fast testing
+        self.tier_configs = [
+            {'name': 'tier0', 'capacity_count': 2, 'capacity_bytes': 1000, 'promotion_threshold': 2, 'demotion_threshold': 1, 'watermark': 0.9},
+            {'name': 'tier1', 'capacity_count': 2, 'capacity_bytes': 1000, 'promotion_threshold': 2, 'demotion_threshold': 1, 'watermark': 0.9},
+            {'name': 'tier2', 'capacity_count': 2, 'capacity_bytes': 1000, 'promotion_threshold': 2, 'demotion_threshold': 1, 'watermark': 0.9},
+        ]
+        self.backends = [MockPMDKBackend(), MockPMDKBackend(), MockPMDKBackend()]
+        self.tiered = TieredBackend(self.backends, self.tier_configs)
+
+    def test_insert_and_retrieve(self):
+        self.tiered.put('frag1', b'data1', b'tokens1')
+        result = self.tiered.get('frag1')
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], b'data1')
+        self.assertEqual(result[1], b'tokens1')
+        meta = self.tiered.metadata['frag1']
+        self.assertEqual(meta['tier'], 0)
+
+    def test_promotion_on_repeated_access(self):
+        self.tiered.put('frag2', b'data2', b'tokens2')
+        # Access enough times to trigger promotion
+        for _ in range(3):
+            self.tiered.get('frag2')
+        # Should be promoted to tier 0 (already there), so demote to tier 1 and test promotion
+        self.tiered._demote('frag2', 0, 1)
+        meta = self.tiered.metadata['frag2']
+        self.assertEqual(meta['tier'], 1)
+        # Access enough times to trigger promotion back to tier 0
+        for _ in range(3):
+            self.tiered.get('frag2')
+        meta = self.tiered.metadata['frag2']
+        self.assertEqual(meta['tier'], 0)
+
+    def test_demotion_on_capacity(self):
+        # Fill tier 0
+        self.tiered.put('frag3', b'data3', b'tokens3')
+        self.tiered.put('frag4', b'data4', b'tokens4')
+        # Next insert should demote coldest
+        self.tiered.put('frag5', b'data5', b'tokens5')
+        # One of the first two should be in tier 1
+        tiers = [self.tiered.metadata[f]['tier'] for f in ['frag3', 'frag4', 'frag5']]
+        self.assertIn(1, tiers)
+        self.assertIn(0, tiers)
+
+    def test_eviction_from_lowest_tier(self):
+        # Fill all tiers
+        self.tiered.put('frag6', b'data6', b'tokens6')
+        self.tiered.put('frag7', b'data7', b'tokens7')
+        self.tiered.put('frag8', b'data8', b'tokens8')
+        self.tiered.put('frag9', b'data9', b'tokens9')
+        self.tiered.put('frag10', b'data10', b'tokens10')
+        self.tiered.put('frag11', b'data11', b'tokens11')
+        # Next insert should evict from system
+        self.tiered.put('frag12', b'data12', b'tokens12')
+        # Only 6 fragments should remain (2 per tier)
+        self.assertEqual(len(self.tiered.metadata), 6)
+        # The evicted fragment should not be retrievable
+        all_frags = set(self.tiered.metadata.keys())
+        for f in ['frag6', 'frag7', 'frag8', 'frag9', 'frag10', 'frag11', 'frag12']:
+            if f not in all_frags:
+                self.assertIsNone(self.tiered.get(f))
 
 
 if __name__ == '__main__':
