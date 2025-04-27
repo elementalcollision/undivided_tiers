@@ -435,7 +435,20 @@ class LeCAR(TieringPolicy):
             max_count = max(self._lfu_scores.values()) if self._lfu_scores else 1.0
             score = current_count / max(max_count, 1.0)
             # DEBUGGING
-            self.logger.debug(f"_get_lfu_score({group_hash}): count={current_count}, max={max_count}, score={score}({type(score)})")
+            # Wrap the problematic log call
+            try:
+                self.logger.debug(f"_get_lfu_score({group_hash}): count={current_count}, max={max_count}, score={score}({type(score)})" )
+            except Exception as log_e:
+                 self.logger.error(f"_get_lfu_score({group_hash}): ERROR IN DEBUG LOGGING: {log_e}")
+                 # Log individual components to isolate the issue
+                 try: self.logger.debug(f"    group_hash: {group_hash} ({type(group_hash)})" )
+                 except Exception as e: self.logger.error(f"    Error logging group_hash: {e}")
+                 try: self.logger.debug(f"    current_count: {current_count} ({type(current_count)})" )
+                 except Exception as e: self.logger.error(f"    Error logging current_count: {e}")
+                 try: self.logger.debug(f"    max_count: {max_count} ({type(max_count)})" )
+                 except Exception as e: self.logger.error(f"    Error logging max_count: {e}")
+                 try: self.logger.debug(f"    score: {score} ({type(score)})" )
+                 except Exception as e: self.logger.error(f"    Error logging score: {e}")
             # END DEBUGGING
             return max(0.0, min(1.0, score))
         except Exception as e:
