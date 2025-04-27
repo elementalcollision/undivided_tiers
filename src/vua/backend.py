@@ -29,6 +29,9 @@ except ImportError:
     logging.warning("prometheus-client not found. Prometheus metrics export will not be available.")
     # Define dummy classes if not available, so code doesn't break
     class DummyMetric:
+        # Added __init__ to accept arbitrary arguments
+        def __init__(self, *args, **kwargs):
+            pass
         def labels(self, *args, **kwargs): return self
         def inc(self, *args, **kwargs): pass
         def set(self, *args, **kwargs): pass
@@ -174,7 +177,7 @@ class PMDKBackend(StorageBackend):
 
         self.pool_path = pool_path
         self.pool_size = pool_size
-        self.pool = None
+        self.pool = None # Initialize pool to None
         self.logger = logging.getLogger(f"PMDKBackend({pool_path})")
 
         try:
@@ -283,6 +286,10 @@ class PMDKBackend(StorageBackend):
         """
         Close the PMDK pool.
         """
+        # Ensure pool attribute exists before trying to access it
+        if not hasattr(self, 'pool'):
+            return
+        
         if self.pool:
             try:
                 self.pool.close()

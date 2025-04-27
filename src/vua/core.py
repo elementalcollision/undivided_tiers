@@ -3,6 +3,8 @@ import os
 import logging
 import torch
 import hashlib
+import tempfile
+import shutil
 from typing import NamedTuple, Tuple, List
 
 
@@ -186,7 +188,29 @@ class VUA:
             # Use backend to store data and tokens
             self._backend.put(group_hash, sliced_group_bytes, sliced_tokens_bytes)
 
-            os.rename(group_dir_tmp, group_dir)
+            # Atomically rename the temporary directory to the final hash path
+            try:
+                # Replace os.rename with shutil.move for potentially better handling
+                shutil.move(group_dir_tmp, group_dir)
+                # os.rename(group_dir_tmp, group_dir)
+            except OSError as e:
+                # Handle potential race condition or other errors during rename
+                logger.error(f"Error renaming temp dir {group_dir_tmp} to {group_dir}: {e}")
+                # Attempt cleanup of temp dir if rename failed
+                try:
+                    shutil.rmtree(group_dir_tmp)
+                except OSError as cleanup_e:
+                    logger.error(f"Failed to cleanup temp dir {group_dir_tmp} after rename error: {cleanup_e}")
+                # Re-raise the original error so the operation failure is known
+                raise e
+            except Exception as e:
+                logger.error(f"Unexpected error during rename/move of {group_dir_tmp}: {e}")
+                # Attempt cleanup
+                try:
+                    shutil.rmtree(group_dir_tmp)
+                except OSError as cleanup_e:
+                     logger.error(f"Failed to cleanup temp dir {group_dir_tmp} after unexpected error: {cleanup_e}")
+                raise e
 
         threads = []
         for group_idx, group_hash in enumerate(path_components):
