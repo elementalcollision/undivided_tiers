@@ -392,7 +392,22 @@ class LeCAR(TieringPolicy):
         lru_score = self._get_lru_score(entry.group_hash)
         lfu_score = self._get_lfu_score(entry.group_hash)
         score = (self.lru_weight * lru_score + self.lfu_weight * lfu_score)
-        return max(0.0, min(1.0, score)) # Clamp score
+        # DEBUGGING:
+        self.logger.debug(f"_get_score({entry.group_hash}): LRU={lru_score}({type(lru_score)}), LFU={lfu_score}({type(lfu_score)}), wLRU={self.lru_weight}({type(self.lru_weight)}), wLFU={self.lfu_weight}({type(self.lfu_weight)}), score={score}({type(score)})")
+        # END DEBUGGING
+        # Check for None intermediate scores just in case
+        if lru_score is None or lfu_score is None or self.lru_weight is None or self.lfu_weight is None:
+             self.logger.error(f"_get_score({entry.group_hash}) encountered None value before clamping!")
+             # Decide on fallback? Return 0.0 for now?
+             return 0.0
+        try:
+             # Ensure score is float before clamping
+             final_score = float(score)
+             clamped_score = max(0.0, min(1.0, final_score))
+             return clamped_score
+        except (ValueError, TypeError) as e:
+             self.logger.error(f"_get_score({entry.group_hash}) error during clamping: score={score}, type={type(score)}, error={e}")
+             return 0.0 # Fallback score on error
     
     def _get_lru_score(self, group_hash: str) -> float:
         try:
@@ -400,15 +415,32 @@ class LeCAR(TieringPolicy):
             list_len = len(self._lru_list)
             if list_len <= 1: return 0.0
             score = idx / (list_len - 1)
+            # DEBUGGING
+            self.logger.debug(f"_get_lru_score({group_hash}): index={idx}, len={list_len}, score={score}({type(score)})")
+            # END DEBUGGING
             return max(0.0, min(1.0, score))
-        except ValueError: return 0.0
+        except ValueError:
+             self.logger.debug(f"_get_lru_score({group_hash}): Not found in LRU list.")
+             return 0.0
+        except Exception as e:
+            self.logger.error(f"_get_lru_score({group_hash}) unexpected error: {e}")
+            return 0.0
             
     def _get_lfu_score(self, group_hash: str) -> float:
-        current_count = self._lfu_scores.get(group_hash, 0.0)
-        if not self._lfu_scores or current_count == 0.0: return 0.0
-        max_count = max(self._lfu_scores.values()) if self._lfu_scores else 1.0
-        score = current_count / max(max_count, 1.0)
-        return max(0.0, min(1.0, score))
+        try:
+            current_count = self._lfu_scores.get(group_hash, 0.0)
+            if not self._lfu_scores or current_count == 0.0: 
+                 self.logger.debug(f"_get_lfu_score({group_hash}): Zero count or no scores.")
+                 return 0.0
+            max_count = max(self._lfu_scores.values()) if self._lfu_scores else 1.0
+            score = current_count / max(max_count, 1.0)
+            # DEBUGGING
+            self.logger.debug(f"_get_lfu_score({group_hash}): count={current_count}, max={max_count}, score={score}({type(score)})")
+            # END DEBUGGING
+            return max(0.0, min(1.0, score))
+        except Exception as e:
+            self.logger.error(f"_get_lfu_score({group_hash}) unexpected error: {e}")
+            return 0.0
         
     def should_admit(self, entry: CacheEntry, tier_idx: int) -> bool:
         if entry.group_hash not in self._entries:
@@ -452,10 +484,20 @@ class LeCAR(TieringPolicy):
     def select_victim(self, entries: List[CacheEntry], tier_idx: int) -> Optional[str]:
         if not entries: return None
         valid_entries = [e for e in entries if e.group_hash in self._entries]
+        # DEBUGGING
+        self.logger.debug(f"select_victim(tier={tier_idx}): Considering {len(valid_entries)}/{len(entries)} entries: {[e.group_hash for e in valid_entries]}")
+        # END DEBUGGING
         if not valid_entries:
-            self.logger.warning(f"select_victim tier {tier_idx}: No tracked entries. Falling back.")
-            victim_score = 0.0
-            victim_hash = entries[0].group_hash
+            self.logger.warning(f"select_victim tier {tier_idx}: No tracked entries among provided list. Falling back to first entry.")
+            # Ensure we have at least one entry to avoid index error if entries is not empty but valid_entries is
+            if entries:
+                 victim_score = 0.0 # Cannot calculate score if not tracked
+                 victim_hash = entries[0].group_hash
+                 if PROMETHEUS_AVAILABLE and self._prom_metrics['victim_scores']:
+                      self._prom_metrics['victim_scores'].observe(victim_score)
+                 return victim_hash
+            else:
+                 return None # No entries provided at all
         else:
             if random.random() < self.config.exploration_rate:
                 if PROMETHEUS_AVAILABLE and self._prom_metrics['exploration_decisions']:
@@ -464,9 +506,21 @@ class LeCAR(TieringPolicy):
                 victim_score = self._get_score(victim_entry)
                 victim_hash = victim_entry.group_hash
             else:
-                victim_entry = min(valid_entries, key=lambda e: self._get_score(e))
-                victim_score = self._get_score(victim_entry)
-                victim_hash = victim_entry.group_hash
+                # Wrap the min call in a try-except to catch the comparison error directly
+                try:
+                    victim_entry = min(valid_entries, key=lambda e: self._get_score(e))
+                    victim_score = self._get_score(victim_entry)
+                    victim_hash = victim_entry.group_hash
+                except (TypeError, ValueError) as e:
+                    self.logger.error(f"select_victim(tier={tier_idx}): Error during min() comparison: {e}. Falling back.")
+                    # Fallback: select the first valid entry
+                    victim_entry = valid_entries[0]
+                    victim_score = self._get_score(victim_entry) # Try to get score for logging
+                    victim_hash = victim_entry.group_hash
+                    # Log scores of all candidates for debugging
+                    candidate_scores = {e.group_hash: self._get_score(e) for e in valid_entries}
+                    self.logger.debug(f"select_victim(tier={tier_idx}): Candidate scores: {candidate_scores}")
+                    
         if PROMETHEUS_AVAILABLE and self._prom_metrics['victim_scores']:
             self._prom_metrics['victim_scores'].observe(victim_score)
         return victim_hash
