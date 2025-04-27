@@ -189,21 +189,34 @@ class PMDKBackend(StorageBackend):
                     self.pool.root = pmemobj.PersistentDict()
             else:
                 # Raise explicitly if pool not found and create=False
+                # This specific case should be caught by FileNotFoundError below
                 raise FileNotFoundError(f"PMDK pool file not found and create=False: {pool_path}")
-        except FileNotFoundError as e: # Catch specific error
-            self.logger.error(f"PMDK pool file not found: {e}")
+
+        # Refined Error Handling Order:
+        except FileNotFoundError as e: # If pool doesn't exist and create=False, or path invalid
+            self.logger.error(f"PMDK pool file not found or path invalid: {e}")
             raise
-        except PermissionError as e: # Catch specific error
-            self.logger.error(f"Permission denied for PMDK pool at {pool_path}: {e}")
+        except PermissionError as e: # Permissions issue
+            self.logger.error(f"Permission denied for PMDK pool operation at {pool_path}: {e}")
             raise
-        except FileExistsError as e: # Catch specific error (less likely here, maybe with create=True?)
-            self.logger.error(f"PMDK pool file unexpectedly exists: {e}")
+        except FileExistsError as e: # If create=True but pool exists unexpectedly (e.g., race condition?)
+            self.logger.error(f"PMDK pool file unexpectedly exists during create attempt: {e}")
             raise
-        except OSError as e: # Catch other OS-level errors
+        except IsADirectoryError as e: # If the provided path is a directory
+             self.logger.error(f"Pool path is a directory, not a file: {pool_path}")
+             raise
+        except MemoryError as e: # Potentially from create if low on memory/space
+             self.logger.error(f"Out of memory/space when creating PMDK pool {pool_path} with size {self.pool_size}: {e}")
+             raise
+        except PmemError as e: # Catch specific PMDK errors *if* PmemError was imported
+             self.logger.error(f"PMDK specific error during pool open/create at {pool_path}: {e}")
+             # TODO: Potentially inspect 'e' further for specific PMDK error codes/types if available
+             raise
+        except OSError as e: # Catch other OS-level errors (disk full, invalid argument, etc.)
             self.logger.error(f"OS error during PMDK pool open/create at {pool_path}: {e}")
             raise
-        except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
-            self.logger.error(f"Failed to open or create PMDK pool at {pool_path}: {e}")
+        except Exception as e: # Catch any other unexpected errors
+            self.logger.error(f"Unexpected error during PMDK pool open/create at {pool_path}: {e}")
             raise
 
     def put(self, group_hash: str, data: bytes, tokens: bytes) -> None:
