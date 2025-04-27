@@ -353,7 +353,7 @@ class LeCAR(TieringPolicy):
     - base_demotion_score_threshold: Base threshold score for demotion (0.0-1.0)
     """
     
-    def __init__(self, config: Optional[PolicyConfig] = None):
+    def __init__(self, config: Optional[PolicyConfig] = None, registry=None):
         self.config = config or PolicyConfig()
         self.logger = logging.getLogger("LeCAR") 
         
@@ -370,17 +370,17 @@ class LeCAR(TieringPolicy):
         if PROMETHEUS_AVAILABLE:
             try:
                 score_buckets = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
-                self._prom_metrics['lru_weight'] = Gauge('vua_policy_lru_weight', 'Current LRU policy weight')
-                self._prom_metrics['lfu_weight'] = Gauge('vua_policy_lfu_weight', 'Current LFU policy weight')
-                self._prom_metrics['ghost_lru_size'] = Gauge('vua_policy_ghost_lru_size', 'Number of entries in LRU ghost cache')
-                self._prom_metrics['ghost_lfu_size'] = Gauge('vua_policy_ghost_lfu_size', 'Number of entries in LFU ghost cache')
-                self._prom_metrics['ghost_hits'] = Counter('vua_policy_ghost_hits_total', 'Total ghost cache hits (hits on items previously evicted)')
-                self._prom_metrics['ghost_additions'] = Counter('vua_policy_ghost_additions_total', 'Total entries added to ghost cache upon eviction')
-                self._prom_metrics['exploration_decisions'] = Counter('vua_policy_exploration_decisions_total', 'Total random exploration decisions')
-                self._prom_metrics['admit_scores'] = Histogram('vua_policy_admit_scores', 'Distribution of scores during admission decisions', buckets=score_buckets)
-                self._prom_metrics['promote_scores'] = Histogram('vua_policy_promote_scores', 'Distribution of scores during promotion decisions', buckets=score_buckets)
-                self._prom_metrics['demote_scores'] = Histogram('vua_policy_demote_scores', 'Distribution of scores during demotion decisions', buckets=score_buckets)
-                self._prom_metrics['victim_scores'] = Histogram('vua_policy_victim_scores', 'Distribution of scores of selected eviction victims', buckets=score_buckets)
+                self._prom_metrics['lru_weight'] = Gauge('vua_policy_lru_weight', 'Current LRU policy weight', registry=registry)
+                self._prom_metrics['lfu_weight'] = Gauge('vua_policy_lfu_weight', 'Current LFU policy weight', registry=registry)
+                self._prom_metrics['ghost_lru_size'] = Gauge('vua_policy_ghost_lru_size', 'Number of entries in LRU ghost cache', registry=registry)
+                self._prom_metrics['ghost_lfu_size'] = Gauge('vua_policy_ghost_lfu_size', 'Number of entries in LFU ghost cache', registry=registry)
+                self._prom_metrics['ghost_hits'] = Counter('vua_policy_ghost_hits_total', 'Total ghost cache hits (hits on items previously evicted)', registry=registry)
+                self._prom_metrics['ghost_additions'] = Counter('vua_policy_ghost_additions_total', 'Total entries added to ghost cache upon eviction', registry=registry)
+                self._prom_metrics['exploration_decisions'] = Counter('vua_policy_exploration_decisions_total', 'Total random exploration decisions', registry=registry)
+                self._prom_metrics['admit_scores'] = Histogram('vua_policy_admit_scores', 'Distribution of scores during admission decisions', buckets=score_buckets, registry=registry)
+                self._prom_metrics['promote_scores'] = Histogram('vua_policy_promote_scores', 'Distribution of scores during promotion decisions', buckets=score_buckets, registry=registry)
+                self._prom_metrics['demote_scores'] = Histogram('vua_policy_demote_scores', 'Distribution of scores during demotion decisions', buckets=score_buckets, registry=registry)
+                self._prom_metrics['victim_scores'] = Histogram('vua_policy_victim_scores', 'Distribution of scores of selected eviction victims', buckets=score_buckets, registry=registry)
             except Exception as e:
                 self.logger.error(f"Failed to initialize Prometheus metrics: {e}")
                 # Fallback to defaultdict means metrics calls will be no-ops
@@ -584,22 +584,64 @@ class LeCAR(TieringPolicy):
         
         if hit:
             ghost_hit = False
+            self.logger.debug(f"Update({group_hash}, hit=True): START weights LRU={self.lru_weight:.4f}, LFU={self.lfu_weight:.4f}") # DEBUG
             if group_hash in self._ghost_lru:
                 ghost_hit = True
                 delta = self.config.learning_rate * (1 - self.lru_weight)
+                self.logger.debug(f"Update({group_hash}): LRU Ghost Hit! delta={delta:.4f}") # DEBUG
                 self.lru_weight = min(self.config.max_weight, self.lru_weight + delta)
+                self.logger.debug(f"Update({group_hash}): LRU weight updated to {self.lru_weight:.4f}") # DEBUG
                 del self._ghost_lru[group_hash]
             elif group_hash in self._ghost_lfu:
                 ghost_hit = True
                 delta = self.config.learning_rate * (1 - self.lfu_weight)
+                self.logger.debug(f"Update({group_hash}): LFU Ghost Hit! delta={delta:.4f}") # DEBUG
+                lfu_before_inc = self.lfu_weight # DEBUG
                 self.lfu_weight = min(self.config.max_weight, self.lfu_weight + delta)
+                self.logger.debug(f"Update({group_hash}): LFU weight updated from {lfu_before_inc:.4f} to {self.lfu_weight:.4f}") # DEBUG
                 del self._ghost_lfu[group_hash]
-                
+
             if ghost_hit:
+                self.logger.debug(f"Update({group_hash}): After ghost hit, pre-norm weights LRU={self.lru_weight:.4f}, LFU={self.lfu_weight:.4f}") # DEBUG
                 if not math.isclose(self.lru_weight + self.lfu_weight, 1.0):
-                    self.lfu_weight = 1.0 - self.lru_weight
+                    self.logger.debug(f"Update({group_hash}): Weights not close to 1.0, renormalizing...") # DEBUG
+                    
+                    # --- Start Fix: Proportional Renormalization --- 
+                    current_sum = self.lru_weight + self.lfu_weight
+                    if current_sum > 1e-9: # Avoid division by zero/near-zero
+                        self.lru_weight /= current_sum
+                        self.lfu_weight /= current_sum
+                        self.logger.debug(f"Update({group_hash}): Weights proportionally normalized: LRU={self.lru_weight:.4f}, LFU={self.lfu_weight:.4f}")
+                    else: # Should ideally not happen if weights start >= 0 and don't go negative
+                        self.lru_weight = 0.5
+                        self.lfu_weight = 0.5
+                        self.logger.warning(f"Update({group_hash}): Weights zero sum during normalization, reset to defaults.")
+
+                    # Clamp weights AFTER proportional normalization
+                    lru_before_clamp = self.lru_weight
+                    lfu_before_clamp = self.lfu_weight
+                    self.lru_weight = max(min(self.lru_weight, self.config.max_weight), self.config.min_weight)
                     self.lfu_weight = max(min(self.lfu_weight, self.config.max_weight), self.config.min_weight)
-                    self.lru_weight = 1.0 - self.lfu_weight
+                    if not math.isclose(self.lru_weight, lru_before_clamp) or not math.isclose(self.lfu_weight, lfu_before_clamp):
+                        self.logger.debug(f"Update({group_hash}): Weights clamped LRU={self.lru_weight:.4f}(from {lru_before_clamp:.4f}), LFU={self.lfu_weight:.4f}(from {lfu_before_clamp:.4f})")
+                    
+                    # Final re-normalization pass ONLY IF clamping potentially made sum != 1.0
+                    final_sum = self.lru_weight + self.lfu_weight
+                    if not math.isclose(final_sum, 1.0):
+                        if final_sum > 1e-9: # Avoid division by zero
+                            self.lru_weight /= final_sum
+                            self.lfu_weight /= final_sum
+                            self.logger.debug(f"Update({group_hash}): Weights final normalization after clamp: LRU={self.lru_weight:.4f}, LFU={self.lfu_weight:.4f}")
+                        else:
+                            # If clamping results in zero sum (unlikely with positive min_weight), reset
+                            self.lru_weight = 0.5
+                            self.lfu_weight = 0.5
+                            self.logger.warning(f"Update({group_hash}): Weights zero sum after clamp, reset to defaults.")
+                    # --- End Fix --- 
+
+                else:
+                    self.logger.debug(f"Update({group_hash}): Weights close to 1.0, no renormalization needed.") # DEBUG
+
                 if PROMETHEUS_AVAILABLE and self._prom_metrics['ghost_hits']:
                     self._prom_metrics['ghost_hits'].inc()
         
@@ -636,7 +678,7 @@ class LeCAR(TieringPolicy):
                  self._prom_metrics['ghost_lfu_size'].set(len(self._ghost_lfu))
 
 class TieredBackend(StorageBackend):
-    def __init__(self, backends, tier_configs, advanced_watermark=0.9, adjustment_interval=1000, policy=None, policy_config=None):
+    def __init__(self, backends, tier_configs, advanced_watermark=0.9, adjustment_interval=1000, policy=None, policy_config=None, registry=None):
         self.backends = backends
         self.tier_configs = tier_configs
         self.advanced_watermark = advanced_watermark
@@ -658,17 +700,17 @@ class TieredBackend(StorageBackend):
 
         # --- Prometheus Metrics Definition ---
         self._prom_labels = ['tier_name']
-        self._prom_hits = Counter('vua_tier_hits_total', 'Total cache hits for a tier', self._prom_labels)
-        self._prom_misses = Counter('vua_tier_misses_total', 'Total cache misses for a tier', self._prom_labels)
-        self._prom_promotions = Counter('vua_tier_promotions_total', 'Total promotions *into* a tier', self._prom_labels)
-        self._prom_demotions = Counter('vua_tier_demotions_total', 'Total demotions *from* a tier', self._prom_labels)
-        self._prom_evictions = Counter('vua_tier_evictions_total', 'Total evictions from a tier', self._prom_labels)
-        self._prom_usage_count = Gauge('vua_tier_usage_fragments', 'Current fragment count in a tier', self._prom_labels)
-        self._prom_usage_bytes = Gauge('vua_tier_usage_bytes', 'Current byte usage in a tier', self._prom_labels)
-        self._prom_capacity_count = Gauge('vua_tier_capacity_fragments', 'Fragment capacity of a tier', self._prom_labels)
-        self._prom_capacity_bytes = Gauge('vua_tier_capacity_bytes', 'Byte capacity of a tier', self._prom_labels)
-        self._prom_advanced_active = Gauge('vua_tier_advanced_metadata_active_fragments', 'Number of fragments using advanced metadata per tier', self._prom_labels)
-        self._prom_avg_eviction_score = Gauge('vua_tier_avg_eviction_score', 'Average eviction score per tier', self._prom_labels)
+        self._prom_hits = Counter('vua_tier_hits_total', 'Total cache hits for a tier', self._prom_labels, registry=registry)
+        self._prom_misses = Counter('vua_tier_misses_total', 'Total cache misses for a tier', self._prom_labels, registry=registry)
+        self._prom_promotions = Counter('vua_tier_promotions_total', 'Total promotions *into* a tier', self._prom_labels, registry=registry)
+        self._prom_demotions = Counter('vua_tier_demotions_total', 'Total demotions *from* a tier', self._prom_labels, registry=registry)
+        self._prom_evictions = Counter('vua_tier_evictions_total', 'Total evictions from a tier', self._prom_labels, registry=registry)
+        self._prom_usage_count = Gauge('vua_tier_usage_fragments', 'Current fragment count in a tier', self._prom_labels, registry=registry)
+        self._prom_usage_bytes = Gauge('vua_tier_usage_bytes', 'Current byte usage in a tier', self._prom_labels, registry=registry)
+        self._prom_capacity_count = Gauge('vua_tier_capacity_fragments', 'Fragment capacity of a tier', self._prom_labels, registry=registry)
+        self._prom_capacity_bytes = Gauge('vua_tier_capacity_bytes', 'Byte capacity of a tier', self._prom_labels, registry=registry)
+        self._prom_advanced_active = Gauge('vua_tier_advanced_metadata_active_fragments', 'Number of fragments using advanced metadata per tier', self._prom_labels, registry=registry)
+        self._prom_avg_eviction_score = Gauge('vua_tier_avg_eviction_score', 'Average eviction score per tier', self._prom_labels, registry=registry)
 
         # --- New Aggregated/Distribution Metrics ---
         # Using Histogram for distributions - define buckets appropriately
@@ -676,9 +718,9 @@ class TieredBackend(StorageBackend):
         count_buckets = (1, 2, 5, 10, 25, 100, float('inf'))
         size_buckets = (1024, 4096, 16384, 65536, 262144, 1048576, float('inf')) # bytes
 
-        self._prom_frag_age = Histogram('vua_tier_fragment_age_seconds', 'Distribution of fragment ages per tier (last access)', self._prom_labels, buckets=age_buckets)
-        self._prom_frag_access_count = Histogram('vua_tier_fragment_access_count', 'Distribution of fragment access counts per tier', self._prom_labels, buckets=count_buckets)
-        self._prom_frag_size = Histogram('vua_tier_fragment_size_bytes', 'Distribution of fragment sizes per tier', self._prom_labels, buckets=size_buckets)
+        self._prom_frag_age = Histogram('vua_tier_fragment_age_seconds', 'Distribution of fragment ages per tier (last access)', self._prom_labels, buckets=age_buckets, registry=registry)
+        self._prom_frag_access_count = Histogram('vua_tier_fragment_access_count', 'Distribution of fragment access counts per tier', self._prom_labels, buckets=count_buckets, registry=registry)
+        self._prom_frag_size = Histogram('vua_tier_fragment_size_bytes', 'Distribution of fragment sizes per tier', self._prom_labels, buckets=size_buckets, registry=registry)
 
         # Initialize gauges for configured capacities and initial usage
         for i, config in enumerate(self.tier_configs):
@@ -691,7 +733,7 @@ class TieredBackend(StorageBackend):
             self._prom_advanced_active.labels(**labels).set(0)
             self._prom_avg_eviction_score.labels(**labels).set(0)
 
-        self.policy = policy or LeCAR(policy_config)  # Use provided config if no custom policy
+        self.policy = policy or LeCAR(policy_config, registry=registry)  # Use provided config if no custom policy
         self.metadata = {}
         self.tier_usage = {
             i: {'count': 0, 'bytes': 0}
