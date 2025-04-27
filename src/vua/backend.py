@@ -518,7 +518,23 @@ class LeCAR(TieringPolicy):
         if not entries: return None
         valid_entries = [e for e in entries if e.group_hash in self._entries]
         # DEBUGGING
-        self.logger.debug(f"select_victim(tier={tier_idx}): Considering {len(valid_entries)}/{len(entries)} entries: {[e.group_hash for e in valid_entries]}")
+        # Wrap problematic log call
+        try:
+            self.logger.debug(f"select_victim(tier={tier_idx}): Considering {len(valid_entries)}/{len(entries)} entries: {[e.group_hash for e in valid_entries]}")
+        except Exception as log_e:
+            self.logger.error(f"select_victim(tier={tier_idx}): ERROR IN DEBUG LOGGING (entry list): {log_e}")
+            try: self.logger.debug(f"    tier_idx: {tier_idx} ({type(tier_idx)})" )
+            except Exception as e: self.logger.error(f"    Error logging tier_idx: {e}")
+            try: self.logger.debug(f"    len(valid_entries): {len(valid_entries)} ({type(len(valid_entries))})" )
+            except Exception as e: self.logger.error(f"    Error logging len(valid_entries): {e}")
+            try: self.logger.debug(f"    len(entries): {len(entries)} ({type(len(entries))})" )
+            except Exception as e: self.logger.error(f"    Error logging len(entries): {e}")
+            # Log group_hashes carefully
+            try:
+                hashes = [str(e.group_hash) for e in valid_entries]
+                self.logger.debug(f"    valid_entry_hashes: {hashes} ({type(hashes)})" )
+            except Exception as e:
+                 self.logger.error(f"    Error logging valid_entry_hashes: {e}")
         # END DEBUGGING
         if not valid_entries:
             self.logger.warning(f"select_victim tier {tier_idx}: No tracked entries among provided list. Falling back to first entry.")
