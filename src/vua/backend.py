@@ -814,17 +814,56 @@ class TieredBackend(StorageBackend):
             return # Stop processing after eviction
 
         # --- Demotion to lower tier logic --- 
-        # (Rest of the demotion logic remains the same)
-        # Check if to_tier is full, recursively demote from to_tier first
-        # ... (recursive demotion loop) ...
+        # Check if to_tier needs space and recursively demote from it first
+        to_config = self.tier_configs[to_tier]
+        to_usage = self.tier_usage[to_tier]
+        while (
+            (to_config.get('capacity_count') and to_usage['count'] >= to_config['capacity_count']) or
+            (to_config.get('capacity_bytes') and to_usage['bytes'] + size_bytes > to_config['capacity_bytes'])
+        ):
+            victim_to_demote = self._find_coldest_fragment(to_tier)
+            if victim_to_demote is None:
+                # Cannot make space, log error and potentially stop demotion?
+                # For now, we'll log and proceed, possibly overwriting if backend allows
+                self.logger.error(f"Could not find victim to demote from tier {to_tier} to make space for {group_hash}. Demotion may fail or overwrite.")
+                break 
+            self.logger.debug(f"Making space in tier {to_tier} for {group_hash} by demoting {victim_to_demote}")
+            self._demote(victim_to_demote, to_tier, to_tier + 1) 
+            # _demote updates usage, so to_usage is refreshed implicitly in the next loop check
+            # Re-fetch usage in case recursive demotion changed it
+            to_usage = self.tier_usage[to_tier] 
+
         # Move data to the target tier (to_tier)
-        # ... (backend put calls) ...
+        try:
+            self.backends[to_tier].put(group_hash, data, tokens)
+        except Exception as e:
+            self.logger.error(f"Error putting {group_hash} into destination tier {to_tier} during demotion: {e}")
+            # If put fails, we might be in an inconsistent state. 
+            # Should we try to put back to from_tier? Or just log?
+            # For now, log and potentially leave the original in from_tier.
+            return # Stop demotion if put fails
+
+        # Remove data from the source tier (from_tier)
+        try:
+            # Assuming put overwrites or backend handles empty data
+            self.backends[from_tier].put(group_hash, b"", b"") 
+        except Exception as e:
+            self.logger.error(f"Error clearing data for {group_hash} from source tier {from_tier} during demotion: {e}")
+            # Data might exist in both tiers now, log this inconsistency.
+
         # Update usage stats for both tiers
-        # ... (_update_tier_usage calls) ...
-        # Update metadata
-        # ... (meta update logic) ...
-        # Update demotion metrics
-        # ... (metrics and prom counter updates) ...
+        self._update_tier_usage(from_tier, -1, -size_bytes)
+        self._update_tier_usage(to_tier, 1, size_bytes)
+
+        # Update metadata (change tier, reset access count)
+        self._update_metadata(group_hash, to_tier, size_bytes, access=False, demotion=True) 
+        
+        # Update demotion metrics (counting demotions *from* the from_tier)
+        self.metrics[from_tier]['demotions'] += 1
+        from_tier_name = self.tier_configs[from_tier].get('name', f'tier_{from_tier}')
+        self._prom_demotions.labels(tier_name=from_tier_name).inc()
+        
+        self.logger.debug(f"Demoted {group_hash} from tier {from_tier} to {to_tier}")
 
     def _update_tier_usage(self, tier_idx, count_delta, bytes_delta):
         """Helper to update tier usage stats and Prometheus gauges."""
@@ -1097,7 +1136,7 @@ class TieredBackend(StorageBackend):
         else:
             self.logger.warning("Cannot start Prometheus server: prometheus-client library not available.")
 
-    def _update_metadata(self, group_hash, tier_idx, size_bytes, access):
+    def _update_metadata(self, group_hash, tier_idx, size_bytes, access, demotion=False):
         """Update internal metadata and inform the policy about the access."""
         # Ensure size_bytes is not None, default to 0 if necessary
         size_bytes = size_bytes if size_bytes is not None else 0
