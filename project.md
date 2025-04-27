@@ -75,6 +75,13 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
     - Integrated snoop filter and per-tier thresholds.
     - Wrote comprehensive unit tests for insertion, retrieval, promotion, demotion, and eviction across tiers using mock backends.
     - Updated README and codebase to reflect new backend and tiering structure.
+    - [ ] Implement Proactive Demotion Logic (`_proactive_demote`)
+        - [ ] Define per-tier watermark configurations (bytes/count thresholds).
+        - [ ] Implement logic to check current tier usage against watermarks.
+        - [ ] Determine target usage level after demotion.
+        - [ ] Loop to find coldest fragments (`_find_coldest_fragment`) and demote them (`_demote`) until usage is below target.
+        - [ ] Add relevant logging.
+        - [ ] Consider trigger frequency and potential recursive effects.
 - [x] Refined PMDKBackend implementation (error handling, type hints)
 - [ ] Test and validate
 - [ ] Document and release
@@ -83,6 +90,21 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
   - Implemented pool creation/opening, persistent dictionary for storage, and transactional puts.
   - Added `close()` method and basic error handling.
   - TODOs remain for specific PMDK error handling (e.g., OOM) and require testing on actual PMEM/CXL hardware.
+- [ ] Complete PMDK Backend Implementation (Expanded)
+  - [ ] **1.1:** Set up PMDK Pool Management System
+  - [ ] **1.2:** Implement Basic PMDK Object Storage Structure
+  - [ ] **1.3:** Implement Transactional Put Operations
+  - [ ] **1.4:** Implement Transactional Get Operations
+  - [ ] **1.5:** Implement Error Handling and Resource Management
+  - [ ] **Review LeCAR/TieredBackend Scoring & Eviction Logic**
+    - [ ] **1:** Review `LeCAR._get_lru_score` (index errors, division by zero, normalization).
+    - [ ] **2:** Review `LeCAR._get_lfu_score` (division by zero, normalization).
+    - [ ] **3:** Review `LeCAR._get_score` (potential `None` values, type errors, clamping).
+    - [ ] **4:** Review `LeCAR.select_victim` (empty lists, `min` key usage, score comparison issues, fallback).
+    - [ ] **5:** Review `TieredBackend._find_coldest_fragment` (call to `policy.select_victim`, empty tier handling).
+    - [ ] **6:** Review `TieredBackend._update_metadata` & `CacheEntry` creation (data consistency).
+    - [ ] **7:** Review `TieredBackend._demote` & `TieredBackend._promote` (state updates, policy calls).
+    - [ ] **8:** Summarize findings & identify potential fixes for benchmark error.
 - [x] **Expanded Dynamic Policy Tuning:**
     - Implemented dynamic adjustment logic for `promotion_threshold`, `demotion_threshold`, and `watermark` in `TieredBackend`.
     - Added Prometheus metrics and logging for all threshold and watermark changes.

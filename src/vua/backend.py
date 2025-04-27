@@ -1207,9 +1207,61 @@ class TieredBackend(StorageBackend):
         return victim_hash
 
     def _proactive_demote(self, tier_idx):
-        # Implementation of _proactive_demote method (currently placeholder)
-        # TODO: Implement proactive demotion based on watermark and policy
-        pass
+        """Proactively demote coldest items if tier usage exceeds watermark."""
+        if tier_idx >= len(self.backends) - 1: # Cannot demote from the last tier
+            return
+
+        try:
+            config = self.tier_configs[tier_idx]
+            usage = self.tier_usage[tier_idx]
+        except IndexError:
+            self.logger.error(f"_proactive_demote: Invalid tier index {tier_idx}")
+            return
+
+        # Get watermarks and capacities from config, providing defaults
+        wm_bytes_ratio = config.get('proactive_demotion_watermark_bytes', 0.9) # Default 90%
+        wm_count_ratio = config.get('proactive_demotion_watermark_count', 0.9) # Default 90%
+        capacity_bytes = config.get('capacity_bytes') # Can be None or 0
+        capacity_count = config.get('capacity_count') # Can be None or 0
+
+        # Determine if proactive demotion is needed based on watermarks
+        demote_needed_bytes = False
+        if capacity_bytes and capacity_bytes > 0: # Check if capacity_bytes is valid
+            threshold_bytes = capacity_bytes * wm_bytes_ratio
+            if usage['bytes'] > threshold_bytes:
+                demote_needed_bytes = True
+
+        demote_needed_count = False
+        if capacity_count and capacity_count > 0: # Check if capacity_count is valid
+            threshold_count = capacity_count * wm_count_ratio
+            if usage['count'] > threshold_count:
+                demote_needed_count = True
+
+        if not demote_needed_bytes and not demote_needed_count:
+            # Usage is below watermarks, no proactive demotion needed
+            self.logger.debug(f"_proactive_demote: Tier {tier_idx} usage ({usage['count']} items, {usage['bytes']} bytes) is below watermarks. Skipping.")
+            return
+
+        self.logger.info(f"_proactive_demote: Triggered for tier {tier_idx}. Usage ({usage['count']}/{capacity_count}, {usage['bytes']}/{capacity_bytes}) exceeds watermark ({wm_count_ratio*100}%/{wm_bytes_ratio*100}%).")
+
+        # Calculate target usage (e.g., 5% below the watermark)
+        target_bytes = threshold_bytes * 0.95 if demote_needed_bytes else float('inf')
+        target_count = threshold_count * 0.95 if demote_needed_count else float('inf')
+
+        # Loop: Demote coldest fragments until usage is below target
+        while (
+            (demote_needed_bytes and usage['bytes'] > target_bytes) or
+            (demote_needed_count and usage['count'] > target_count)
+        ):
+            victim = self._find_coldest_fragment(tier_idx)
+            if victim is None:
+                self.logger.warning(f"_proactive_demote: No victim found in tier {tier_idx} during proactive demotion. Stopping.")
+                break
+            self.logger.info(f"_proactive_demote: Demoting coldest fragment {victim} from tier {tier_idx}.")
+            self._demote(victim, tier_idx, tier_idx + 1)
+            # Re-fetch usage after demotion
+            usage = self.tier_usage[tier_idx]
+        # End of proactive demotion loop
 
     def _can_promote(self, group_hash, from_tier, to_tier):
         """Check if an entry can be promoted based on policy decision."""
