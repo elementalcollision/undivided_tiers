@@ -217,6 +217,7 @@ def save_results_csv(results, args, filename):
         'lr', 'er', 'w_lru', 'w_lfu', 'ttl', 'w_min', 'w_max', 'p_thresh', 'd_thresh',
         'adj_interval',
         'total_time_s', 'ops_per_sec', 'total_gets', 'total_puts', 'total_hits',
+        'total_ops',
         'hit_rate', 'avg_latency_ms', 
         'final_lru_weight', 'final_lfu_weight', 'final_tier_usage'
     ]
