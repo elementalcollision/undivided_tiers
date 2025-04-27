@@ -71,6 +71,14 @@ class StorageBackend(ABC):
         """
         pass
 
+    @abstractmethod
+    def delete(self, group_hash: str) -> None:
+        """
+        Delete a cache fragment by group_hash.
+        Should handle cases where the fragment doesn't exist gracefully.
+        """
+        pass
+
 class FileSystemBackend(StorageBackend):
     """
     Storage backend that uses the local filesystem (current VUA behavior).
@@ -122,6 +130,24 @@ class FileSystemBackend(StorageBackend):
         tokens_path = os.path.join(group_dir, "_tokens.safetensors")
         return os.path.isdir(group_dir) and os.path.isfile(data_path) and os.path.isfile(tokens_path)
 
+    def delete(self, group_hash: str) -> None:
+        """Remove the directory and its contents for the given group_hash."""
+        group_dir = os.path.join(self.root_path, group_hash)
+        if os.path.isdir(group_dir):
+            try:
+                # Use shutil.rmtree to remove the directory and all its contents
+                import shutil
+                shutil.rmtree(group_dir)
+                # Add check after deletion attempt
+                if not os.path.exists(group_dir):
+                    logging.debug(f"FileSystemBackend: Successfully deleted directory {group_dir}")
+                else:
+                    logging.error(f"FileSystemBackend: Failed to delete directory {group_dir} - it still exists after rmtree.")
+            except OSError as e:
+                logging.error(f"FileSystemBackend: Error deleting directory {group_dir}: {e}")
+        else:
+            logging.debug(f"FileSystemBackend: Directory {group_dir} not found for deletion.")
+
 class MockPMDKBackend(StorageBackend):
     """
     Mock backend that simulates PMDK persistent memory using an in-memory dict.
@@ -139,6 +165,18 @@ class MockPMDKBackend(StorageBackend):
     def exists(self, group_hash: str) -> bool:
         return group_hash in self._store
 
+    def delete(self, group_hash: str) -> None:
+        """Delete the entry from the mock store."""
+        if group_hash in self._store:
+            try:
+                del self._store[group_hash]
+                logging.debug(f"MockPMDKBackend: Deleted {group_hash}")
+            except KeyError:
+                # Should not happen due to the check, but handle defensively
+                logging.warning(f"MockPMDKBackend: Key {group_hash} not found during delete despite check.")
+        else:
+            logging.debug(f"MockPMDKBackend: Key {group_hash} not found for deletion.")
+
 class MockGPURAMBackend(StorageBackend):
     """
     Mock backend simulating GPU RAM using an in-memory dict.
@@ -154,6 +192,17 @@ class MockGPURAMBackend(StorageBackend):
 
     def exists(self, group_hash: str) -> bool:
         return group_hash in self._store
+
+    def delete(self, group_hash: str) -> None:
+        """Delete the entry from the mock store."""
+        if group_hash in self._store:
+            try:
+                del self._store[group_hash]
+                logging.debug(f"MockGPURAMBackend: Deleted {group_hash}")
+            except KeyError:
+                logging.warning(f"MockGPURAMBackend: Key {group_hash} not found during delete despite check.")
+        else:
+            logging.debug(f"MockGPURAMBackend: Key {group_hash} not found for deletion.")
 
 class PMDKBackend(StorageBackend):
     """
@@ -280,6 +329,23 @@ class PMDKBackend(StorageBackend):
             return group_hash in self.pool.root
         except (PmemError, Exception) if PmemError else Exception as e: # Catch PMDK specific or general errors
             self.logger.error(f"Failed to check existence of {group_hash} in PMDK pool: {e}")
+            raise
+
+    def delete(self, group_hash: str) -> None:
+        """Delete a key-value pair from the PMDK pool's root dictionary."""
+        if self.pool is None:
+            raise RuntimeError("PMDK pool is not open.")
+
+        try:
+            with self.pool.transaction():
+                if group_hash in self.pool.root:
+                    del self.pool.root[group_hash]
+                    self.logger.debug(f"Deleted {group_hash} from PMDK pool.")
+                else:
+                    self.logger.debug(f"Key {group_hash} not found in PMDK pool for deletion.")
+        except (PmemError, KeyError, Exception) if PmemError else (KeyError, Exception) as e:
+            # Catch potential PMDK errors, or KeyError if key disappears mid-transaction
+            self.logger.error(f"Failed to delete {group_hash} from PMDK pool: {e}")
             raise
 
     def close(self):
@@ -480,7 +546,8 @@ class LeCAR(TieringPolicy):
             self._entries[entry.group_hash] = entry
             if entry.group_hash not in self._lru_list:
                  self._lru_list.append(entry.group_hash)
-            self._lfu_scores[entry.group_hash] = entry.access_count 
+            # Restore original logic: Set LFU score based on incoming entry during admission check
+            self._lfu_scores[entry.group_hash] = entry.access_count
         score = self._get_score(entry)
         if PROMETHEUS_AVAILABLE and self._prom_metrics['admit_scores']:
             self._prom_metrics['admit_scores'].observe(score)
@@ -579,7 +646,10 @@ class LeCAR(TieringPolicy):
         self._entries[group_hash] = entry 
         if group_hash in self._lru_list:
             self._lru_list.remove(group_hash)
-        self._lru_list.append(group_hash) 
+        self._lru_list.append(group_hash)
+        # Remove temporary print statement
+        # current_lfu = self._lfu_scores.get(group_hash, 0)
+        # print(f"TEMP DEBUG: LeCAR.update({group_hash}), hit={hit}, current_lfu={current_lfu}, incrementing...")
         self._lfu_scores[group_hash] = self._lfu_scores.get(group_hash, 0) + 1
         
         if hit:
@@ -742,9 +812,12 @@ class TieredBackend(StorageBackend):
 
     def get(self, group_hash: str) -> Optional[tuple[bytes, bytes]]:
         self.op_count += 1
+        # print(f"TEMP DEBUG: get({group_hash}): Starting search.") # Remove print
         for tier_idx, backend in enumerate(self.backends):
+            # print(f"TEMP DEBUG: get({group_hash}): Checking tier {tier_idx}.") # Remove print
             result = backend.get(group_hash)
             if result is not None:
+                # print(f"TEMP DEBUG: get({group_hash}): Found in tier {tier_idx}.") # Remove print
                 size_bytes = None
                 if group_hash in self.metadata:
                     size_bytes = self.metadata[group_hash].get('size_bytes', None)
@@ -753,8 +826,22 @@ class TieredBackend(StorageBackend):
                 self._prom_hits.labels(tier_name=self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')).inc()
                 # Promotion logic
                 if tier_idx > 0 and meta['access_count'] >= meta.get('promotion_threshold', 1):
-                    if self._can_promote(group_hash, tier_idx, tier_idx - 1):
+                    # Refetch meta after update before checking promotion
+                    meta = self.metadata.get(group_hash)
+                    if not meta: # Handle edge case where metadata might disappear
+                        self.logger.warning(f"Metadata for {group_hash} disappeared before promotion check.")
+                        return result # or continue based on desired behavior
+                        
+                    can_promote_result = self._can_promote(group_hash, tier_idx, tier_idx - 1)
+                    # Add temporary debug prints
+                    # policy_score = self.policy._get_score(CacheEntry(group_hash=group_hash, size_bytes=meta.get('size_bytes',0), last_access_time=meta.get('last_access',0), access_count=meta.get('access_count',0), tier_idx=tier_idx)) if hasattr(self.policy, '_get_score') else 'N/A'
+                    # promo_thresh = self.policy.config.base_promotion_score_threshold if hasattr(self.policy, 'config') else 'N/A'
+                    # adj_thresh = promo_thresh - (0.1 * (tier_idx - (tier_idx - 1))) if isinstance(promo_thresh, (int, float)) else 'N/A'
+                    # print(f"TEMP DEBUG: get({group_hash}): Promoting? tier={tier_idx}>0, access={meta['access_count']}, thresh_met=True, can_promote={can_promote_result}, score={policy_score}, promo_thresh={promo_thresh}, adjusted_thresh={adj_thresh}")
+                    # End temporary debug prints
+                    if can_promote_result:
                         promo_tier_name = self.tier_configs[tier_idx - 1].get('name', f'tier_{tier_idx - 1}')
+                        # print(f"TEMP DEBUG: get({group_hash}): Calling _promote from {tier_idx} to {tier_idx - 1}") # Remove print
                         self._promote(group_hash, tier_idx, tier_idx - 1)
                         self.metrics[tier_idx]['promotions'] += 1
                         self._prom_promotions.labels(tier_name=promo_tier_name).inc() # Count promotion *into* the tier
@@ -888,7 +975,8 @@ class TieredBackend(StorageBackend):
         # Remove data from the source tier (from_tier)
         try:
             # Assuming put overwrites or backend handles empty data
-            self.backends[from_tier].put(group_hash, b"", b"") 
+            # self.backends[from_tier].put(group_hash, b"", b"") # OLD WAY
+            self.backends[from_tier].delete(group_hash) # NEW WAY
         except Exception as e:
             self.logger.error(f"Error clearing data for {group_hash} from source tier {from_tier} during demotion: {e}")
             # Data might exist in both tiers now, log this inconsistency.
@@ -918,6 +1006,7 @@ class TieredBackend(StorageBackend):
         # Clamp usage to avoid negative values due to potential inconsistencies
         usage['count'] = max(0, usage['count'])
         usage['bytes'] = max(0, usage['bytes'])
+        # print(f"TEMP DEBUG: _update_tier_usage(tier={tier_idx}, count_delta={count_delta}, bytes_delta={bytes_delta}) -> New count={usage['count']}, New bytes={usage['bytes']}") # Add print
         
         # Update Prometheus Gauges
         tier_name = self.tier_configs[tier_idx].get('name', f'tier_{tier_idx}')
@@ -976,7 +1065,8 @@ class TieredBackend(StorageBackend):
             self._prom_promotions.labels(tier_name=self.tier_configs[to_tier].get('name', f'tier_{to_tier}')).inc()
         # Move to new tier
         self.backends[to_tier].put(group_hash, data, tokens)
-        self.backends[from_tier].put(group_hash, b"", b"")
+        # self.backends[from_tier].put(group_hash, b"", b"") # OLD WAY
+        self.backends[from_tier].delete(group_hash) # NEW WAY
         self.tier_usage[from_tier]['count'] -= 1
         self.tier_usage[from_tier]['bytes'] -= size_bytes
         self.tier_usage[to_tier]['count'] += 1
@@ -1204,10 +1294,14 @@ class TieredBackend(StorageBackend):
             access_count=meta['access_count'],
             tier_idx=tier_idx
         )
-        
+
+        # Determine the 'hit' flag for the policy based on 'access'
+        is_hit = bool(access) # Explicitly convert to bool
+
         # Update policy state
         try:
-             self.policy.update(entry, access) 
+             self.logger.debug(f"_update_metadata: Calling policy.update for {group_hash} with hit={is_hit}") # Add log
+             self.policy.update(entry, is_hit)
         except Exception as e:
              self.logger.error(f"Error calling policy.update for {group_hash}: {e}")
              
@@ -1320,7 +1414,9 @@ class TieredBackend(StorageBackend):
         )
         
         try:
-             return self.policy.should_promote(entry, from_tier, to_tier)
+             should_promote = self.policy.should_promote(entry, from_tier, to_tier)
+             # Temporary print removed
+             return should_promote
         except Exception as e:
              self.logger.error(f"Error calling policy.should_promote for {group_hash}: {e}")
              return False # Default to no promotion on error
@@ -1344,3 +1440,48 @@ class TieredBackend(StorageBackend):
                 return True
         self.logger.debug(f"Exists check: {group_hash} not found in any tier.")
         return False 
+
+    def delete(self, group_hash: str) -> None:
+        """Delete a fragment from all tiers and internal metadata."""
+        found_and_deleted = False
+        original_tier = -1
+        size_bytes = 0
+
+        # Remove from metadata first to get its location and size
+        if group_hash in self.metadata:
+            meta = self.metadata.pop(group_hash)
+            original_tier = meta.get('tier', -1)
+            size_bytes = meta.get('size_bytes', 0)
+            found_and_deleted = True # Considered deleted from metadata perspective
+            if original_tier != -1:
+                 # Update usage stats for the tier it was in
+                 self._update_tier_usage(original_tier, -1, -size_bytes)
+                 self.logger.debug(f"Removed metadata for {group_hash} from tier {original_tier}")
+                 # Inform the policy about the eviction/deletion if applicable
+                 evicted_entry = CacheEntry(
+                     group_hash=group_hash,
+                     size_bytes=size_bytes,
+                     last_access_time=meta.get('last_access', time.time()),
+                     access_count=meta.get('access_count', 0),
+                     tier_idx=original_tier
+                 )
+                 if hasattr(self.policy, 'evict'):
+                     try:
+                         self.policy.evict(evicted_entry)
+                     except Exception as e:
+                         self.logger.error(f"Error calling policy.evict during delete for {group_hash}: {e}")
+            else:
+                 self.logger.warning(f"Metadata for {group_hash} removed but had invalid original tier.")
+
+        # Attempt to delete from all underlying backends
+        for tier_idx, backend in enumerate(self.backends):
+            try:
+                # We call delete even if we didn't find metadata, 
+                # in case backend state is somehow inconsistent.
+                backend.delete(group_hash)
+            except Exception as e:
+                # Log error but continue trying other backends
+                self.logger.error(f"Error deleting {group_hash} from backend tier {tier_idx}: {e}")
+
+        if not found_and_deleted:
+            self.logger.debug(f"Attempted to delete {group_hash}, but it was not found in metadata.")

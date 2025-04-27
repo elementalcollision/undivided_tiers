@@ -1,9 +1,12 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 import unittest
 import torch
 import logging
 import tempfile
 import shutil
-import os
+from unittest.mock import patch, MagicMock, call
 
 from vua.core import VUA, VUAConfig
 from vua.serdes import tensor_to_bytes, bytes_to_tensor
@@ -164,35 +167,271 @@ class TestSerdes(unittest.TestCase):
                         "Deserialized tensor does not match the original")
 
 
+# Constants for PMDK tests
+TEST_POOL_PATH = "/test/pmdk_pool.pmem"
+TEST_POOL_SIZE = 1024 * 1024 * 32 # 32MB
+
 class TestPMDKBackend(unittest.TestCase):
+    # We mock pmemobj for most tests, so setUp/tearDown manage mocks not files
     def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.backend = PMDKBackend(self.temp_dir)
+        # Patch pmemobj for the duration of the test class if it's None
+        # If pmemobj *is* available, tests might try to use it unless explicitly mocked per-test
+        self.pmemobj_patcher = patch('vua.backend.pmemobj', spec=True) # Use spec for better mocking
+        self.mock_pmemobj = self.pmemobj_patcher.start()
+        # Mock the error class if it exists
+        self.pmemerror_patcher = patch('vua.backend.PmemError', spec=True)
+        MockPmemErrorType = self.pmemerror_patcher.start() # Get the mocked type
+        # Define a local dummy exception if PmemError was None
+        if MockPmemErrorType is None:
+            class DummyPmemError(Exception): pass
+            self.MockPmemError = DummyPmemError
+        else:
+            # If PmemError was mocked, use the mock type for isinstance checks etc.
+            # For assertRaises, we need an actual exception type. Let's ensure MockPmemErrorType
+            # behaves like a type. If it's a MagicMock, we might need a different approach,
+            # but spec=True should make it reasonable.
+            # We'll assume the mocked type works with assertRaises for now.
+            self.MockPmemError = MockPmemErrorType
+
+        # Prevent tests from trying to access the filesystem unless specifically intended
+        self.os_path_exists_patcher = patch('os.path.exists')
+        self.mock_os_path_exists = self.os_path_exists_patcher.start()
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        self.pmemobj_patcher.stop()
+        self.pmemerror_patcher.stop()
+        self.os_path_exists_patcher.stop()
 
+    # --- Tests for __init__ (Task 1.1) ---
+    def test_init_imports_missing(self):
+        """Test that ImportError is raised if pmemobj is None."""
+        with patch('vua.backend.pmemobj', None):
+             with self.assertRaisesRegex(ImportError, "PMDK pmemobj binding not found"):
+                  PMDKBackend(TEST_POOL_PATH)
+
+    def test_init_creates_pool(self):
+        """Test pool creation when file doesn't exist and create=True."""
+        self.mock_os_path_exists.return_value = False
+        mock_pool_instance = MagicMock()
+        self.mock_pmemobj.create.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, pool_size=TEST_POOL_SIZE, create=True)
+
+        self.mock_os_path_exists.assert_called_once_with(TEST_POOL_PATH)
+        self.mock_pmemobj.create.assert_called_once_with(TEST_POOL_PATH, PMDKBackend.LAYOUT_NAME, TEST_POOL_SIZE)
+        self.mock_pmemobj.open.assert_not_called()
+        # Check if the transaction for root initialization was called
+        mock_pool_instance.transaction.assert_called_once()
+        self.assertEqual(backend.pool, mock_pool_instance)
+
+    def test_init_opens_existing_pool(self):
+        """Test opening an existing pool when create=True."""
+        self.mock_os_path_exists.return_value = True
+        mock_pool_instance = MagicMock()
+        self.mock_pmemobj.open.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=True)
+
+        self.mock_os_path_exists.assert_called_once_with(TEST_POOL_PATH)
+        self.mock_pmemobj.open.assert_called_once_with(TEST_POOL_PATH, PMDKBackend.LAYOUT_NAME)
+        self.mock_pmemobj.create.assert_not_called()
+        self.assertEqual(backend.pool, mock_pool_instance)
+
+    def test_init_opens_existing_pool_no_create(self):
+        """Test opening an existing pool when create=False."""
+        self.mock_os_path_exists.return_value = True
+        mock_pool_instance = MagicMock()
+        self.mock_pmemobj.open.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
+
+        self.mock_os_path_exists.assert_called_once_with(TEST_POOL_PATH)
+        self.mock_pmemobj.open.assert_called_once_with(TEST_POOL_PATH, PMDKBackend.LAYOUT_NAME)
+        self.mock_pmemobj.create.assert_not_called()
+        self.assertEqual(backend.pool, mock_pool_instance)
+
+    def test_init_raises_filenotfound_if_no_pool_and_create_false(self):
+        """Test FileNotFoundError is raised if pool doesn't exist and create=False."""
+        self.mock_os_path_exists.return_value = False
+        with self.assertRaisesRegex(FileNotFoundError, "PMDK pool file not found and create=False"):
+            PMDKBackend(TEST_POOL_PATH, create=False)
+        self.mock_os_path_exists.assert_called_once_with(TEST_POOL_PATH)
+        self.mock_pmemobj.open.assert_not_called()
+        self.mock_pmemobj.create.assert_not_called()
+
+    def test_init_raises_permission_error_on_create(self):
+        """Test PermissionError is caught and raised during create."""
+        self.mock_os_path_exists.return_value = False
+        self.mock_pmemobj.create.side_effect = PermissionError("Test permission denied")
+        with self.assertRaisesRegex(PermissionError, "Test permission denied"):
+            PMDKBackend(TEST_POOL_PATH, create=True)
+        self.mock_pmemobj.create.assert_called_once()
+
+    def test_init_raises_permission_error_on_open(self):
+        """Test PermissionError is caught and raised during open."""
+        self.mock_os_path_exists.return_value = True
+        self.mock_pmemobj.open.side_effect = PermissionError("Test permission denied open")
+        with self.assertRaisesRegex(PermissionError, "Test permission denied open"):
+            PMDKBackend(TEST_POOL_PATH, create=False)
+        self.mock_pmemobj.open.assert_called_once()
+
+    def test_init_raises_pmem_error_on_create(self):
+        """Test specific PmemError is caught and raised during create."""
+        self.mock_os_path_exists.return_value = False
+        # Instantiate the error type we stored in setUp
+        test_error = self.MockPmemError("PMDK create failed")
+        self.mock_pmemobj.create.side_effect = test_error
+        # Use the stored type with assertRaises
+        with self.assertRaises(self.MockPmemError) as cm:
+            PMDKBackend(TEST_POOL_PATH, create=True)
+        # Check the raised exception instance
+        self.assertIsInstance(cm.exception, self.MockPmemError)
+        self.mock_pmemobj.create.assert_called_once()
+
+    def test_init_raises_pmem_error_on_open(self):
+        """Test specific PmemError is caught and raised during open."""
+        self.mock_os_path_exists.return_value = True
+        # Instantiate the error type
+        test_error = self.MockPmemError("PMDK open failed")
+        self.mock_pmemobj.open.side_effect = test_error
+        # Use the stored type with assertRaises
+        with self.assertRaises(self.MockPmemError) as cm:
+            PMDKBackend(TEST_POOL_PATH, create=False)
+        # Check the raised exception instance
+        self.assertIsInstance(cm.exception, self.MockPmemError)
+        self.mock_pmemobj.open.assert_called_once()
+
+    def test_close_closes_pool_and_clears_ref(self):
+        """Test that close() calls pool.close() and sets self.pool to None."""
+        self.mock_os_path_exists.return_value = True
+        mock_pool_instance = MagicMock()
+        self.mock_pmemobj.open.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
+        self.assertEqual(backend.pool, mock_pool_instance)
+
+        backend.close()
+
+        mock_pool_instance.close.assert_called_once()
+        self.assertIsNone(backend.pool)
+
+    def test_close_handles_already_closed(self):
+        """Test that close() does nothing if pool is already None."""
+        self.mock_os_path_exists.return_value = True
+        mock_pool_instance = MagicMock()
+        self.mock_pmemobj.open.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
+        backend.pool = None # Simulate already closed
+
+        backend.close() # Should not raise error
+        mock_pool_instance.close.assert_not_called()
+
+    def test_close_handles_close_error(self):
+        """Test that close() logs error but sets pool to None even if pool.close() fails."""
+        self.mock_os_path_exists.return_value = True
+        mock_pool_instance = MagicMock()
+        # Instantiate the error type
+        mock_pool_instance.close.side_effect = self.MockPmemError("Failed to close")
+        self.mock_pmemobj.open.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
+        # Use assertLogs to check log messages
+        with self.assertLogs(backend.logger, level='ERROR') as log_cm:
+            backend.close()
+        self.assertIn("Error closing PMDK pool", log_cm.output[0])
+        mock_pool_instance.close.assert_called_once()
+        self.assertIsNone(backend.pool)
+
+    def test_del_closes_pool(self):
+        """Test that the pool is closed when the backend object is deleted."""
+        self.mock_os_path_exists.return_value = True
+        mock_pool_instance = MagicMock()
+        self.mock_pmemobj.open.return_value = mock_pool_instance
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
+        mock_pool_ref = backend.pool # Keep a ref to check close call
+
+        del backend # Trigger __del__
+
+        mock_pool_ref.close.assert_called_once()
+
+    # --- Tests for put/get/exists (Task 1.3, 1.4) --- 
+    # These tests now use the mocked pmemobj
     def test_put_and_exists(self):
+        # Setup mock pool and root dict for this test
+        mock_pool = MagicMock()
+        mock_root = MagicMock(spec=dict) # Mock PersistentDict
+        mock_pool.transaction.return_value.__enter__.return_value = None # Mock transaction context
+        mock_pool.root = mock_root
+        self.mock_pmemobj.open.return_value = mock_pool
+        self.mock_os_path_exists.return_value = True
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
         group_hash = "testhash"
         data = b"testdata"
         tokens = b"testtokens"
-        self.backend.put(group_hash, data, tokens)
-        self.assertTrue(self.backend.exists(group_hash))
+        
+        # Mock the PersistentBytes class within the scope of put
+        with patch('vua.backend.pmemobj.PersistentBytes', side_effect=lambda x: x) as mock_pbytes:
+            backend.put(group_hash, data, tokens)
+        
+        # Check transaction was used
+        mock_pool.transaction.assert_called_once()
+        # Check PersistentBytes was called for data and tokens
+        mock_pbytes.assert_has_calls([call(data), call(tokens)])
+        # Check item was added to the mock root dict
+        mock_root.__setitem__.assert_called_once_with(group_hash, (data, tokens))
+
+        # Test exists
+        mock_root.__contains__.return_value = True # Simulate key exists
+        self.assertTrue(backend.exists(group_hash))
+        mock_root.__contains__.assert_called_with(group_hash)
 
     def test_get_returns_correct_data(self):
+        # Setup mock pool and root dict
+        mock_pool = MagicMock()
+        mock_root = MagicMock(spec=dict)
+        mock_pool.root = mock_root
+        self.mock_pmemobj.open.return_value = mock_pool
+        self.mock_os_path_exists.return_value = True
+        
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
         group_hash = "testhash2"
         data = b"somedata"
         tokens = b"sometokens"
-        self.backend.put(group_hash, data, tokens)
-        result = self.backend.get(group_hash)
+        
+        # Simulate data exists in the pool root
+        # Return bytes directly, as PersistentBytes was mocked away in put test
+        mock_root.get.return_value = (data, tokens)
+        
+        result = backend.get(group_hash)
+        
+        mock_root.get.assert_called_once_with(group_hash)
         self.assertIsNotNone(result)
         data_out, tokens_out = result
         self.assertEqual(data_out, data)
         self.assertEqual(tokens_out, tokens)
 
     def test_get_returns_none_for_missing(self):
-        self.assertIsNone(self.backend.get("nonexistent"))
-        self.assertFalse(self.backend.exists("nonexistent"))
+        # Setup mock pool and root dict
+        mock_pool = MagicMock()
+        mock_root = MagicMock(spec=dict)
+        mock_pool.root = mock_root
+        self.mock_pmemobj.open.return_value = mock_pool
+        self.mock_os_path_exists.return_value = True
+
+        backend = PMDKBackend(TEST_POOL_PATH, create=False)
+
+        # Simulate key not found
+        mock_root.get.return_value = None
+        mock_root.__contains__.return_value = False
+
+        self.assertIsNone(backend.get("nonexistent"))
+        mock_root.get.assert_called_once_with("nonexistent")
+        
+        self.assertFalse(backend.exists("nonexistent"))
+        mock_root.__contains__.assert_called_once_with("nonexistent")
 
 
 class TestTieredBackend(unittest.TestCase):

@@ -43,6 +43,36 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
 5. Validate on CXL/PMEM hardware.
 6. Document usage and configuration.
 
+## GPU Server Integration (via SSH)
+
+To enable large-scale benchmarking and real-world validation, the project will be integrated with a remote GPU-based server accessible over SSH. This section tracks the steps and requirements for successful deployment and execution on a GPU server.
+
+### Checklist
+- [ ] **Server Preparation**
+    - [ ] Ensure the GPU server is accessible via SSH and credentials are available.
+    - [ ] Confirm Python, CUDA, and required libraries (PyTorch, PMDK, etc.) are installed.
+    - [ ] Set up a Python virtual environment on the server for isolation.
+- [ ] **Code Deployment**
+    - [ ] Use `rsync`, `scp`, or a Git workflow to deploy the codebase to the server.
+    - [ ] Ensure all dependencies are installed (`pip install -r requirements.txt` or equivalent).
+- [ ] **Configuration**
+    - [ ] Update configuration files (e.g., `VUAConfig`, environment variables) for the server environment (paths, backend selection, GPU device, etc.).
+    - [ ] Set up any required environment variables for CUDA, PMDK, and Prometheus.
+- [ ] **Remote Execution**
+    - [ ] Use SSH to run scripts and tests on the server (e.g., `ssh user@server 'cd /path/to/project && python scripts/benchmark_policy.py'`).
+    - [ ] Optionally, use `tmux` or `screen` for persistent sessions.
+- [ ] **Monitoring & Logging**
+    - [ ] Set up Prometheus metrics endpoint to be accessible (open port or use SSH tunneling).
+    - [ ] Configure logging to files for later retrieval and analysis.
+- [ ] **Automation (Optional)**
+    - [ ] Write helper scripts for deployment, remote execution, and log retrieval.
+    - [ ] Consider using tools like `fabric`, `paramiko`, or GitHub Actions for automation.
+- [ ] **Validation**
+    - [ ] Run integration and performance tests on the GPU server.
+    - [ ] Collect and analyze results, update tuning as needed.
+
+---
+
 ## Risks & Open Questions
 - Python/PMDK integration complexity.
 - Hardware/OS support for CXL memory.
@@ -75,13 +105,13 @@ VUA currently stores key-value cache data on the filesystem. To support next-gen
     - Integrated snoop filter and per-tier thresholds.
     - Wrote comprehensive unit tests for insertion, retrieval, promotion, demotion, and eviction across tiers using mock backends.
     - Updated README and codebase to reflect new backend and tiering structure.
-    - [ ] Implement Proactive Demotion Logic (`_proactive_demote`)
-        - [ ] Define per-tier watermark configurations (bytes/count thresholds).
-        - [ ] Implement logic to check current tier usage against watermarks.
-        - [ ] Determine target usage level after demotion.
-        - [ ] Loop to find coldest fragments (`_find_coldest_fragment`) and demote them (`_demote`) until usage is below target.
-        - [ ] Add relevant logging.
-        - [ ] Consider trigger frequency and potential recursive effects.
+    - [x] Implement Proactive Demotion Logic (`_proactive_demote`)
+        - [x] Define per-tier watermark configurations (bytes/count thresholds).
+        - [x] Implement logic to check current tier usage against watermarks.
+        - [x] Determine target usage level after demotion.
+        - [x] Loop to find coldest fragments (`_find_coldest_fragment`) and demote them (`_demote`) until usage is below target.
+        - [x] Add relevant logging.
+        - [x] Consider trigger frequency and potential recursive effects.
 - [x] Refined PMDKBackend implementation (error handling, type hints)
 - [ ] Test and validate
 - [ ] Document and release

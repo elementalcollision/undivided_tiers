@@ -9,7 +9,7 @@ import io # Import io for StringIO
 import math
 
 # Assuming backend.py is in src/vua relative to the workspace root
-from src.vua.backend import LeCAR, PolicyConfig, CacheEntry
+from vua.backend import LeCAR, PolicyConfig, CacheEntry
 
 # Add import for CollectorRegistry
 try:
@@ -321,7 +321,7 @@ class TestLeCARPolicy(unittest.TestCase):
         self.assertEqual(self.policy._lfu_scores["hash_2"], 1)
 
     # --- Ghost Cache and Learning Tests ---
-    @patch('src.vua.backend.time.time') # Mock time
+    @patch('vua.backend.time.time') # Mock time
     def test_evict_adds_to_ghost_cache_and_cleans_state(self, mock_time):
         """Test evict() adds entry to appropriate ghost cache and removes from main state."""
         mock_time.return_value = 1000.0 # Set current time
@@ -363,7 +363,7 @@ class TestLeCARPolicy(unittest.TestCase):
         self.assertNotIn("hash_2", self.policy._lru_list)
         self.assertNotIn("hash_2", self.policy._lfu_scores)
 
-    @patch('src.vua.backend.time.time') # Mock time
+    @patch('vua.backend.time.time') # Mock time
     @patch('logging.getLogger') # Mock getLogger to control level
     def test_update_learns_from_lru_ghost_hit(self, mock_get_logger, mock_time):
         """Test LRU weight increases after a hit on an entry in the LRU ghost cache."""
@@ -415,7 +415,7 @@ class TestLeCARPolicy(unittest.TestCase):
         # log_output = log_stream.getvalue()
         # self.assertIn("LRU Ghost Hit!", log_output)
 
-    @patch('src.vua.backend.time.time') # Mock time
+    @patch('vua.backend.time.time') # Mock time
     @patch('logging.getLogger') # Mock getLogger to control level
     def test_update_learns_from_lfu_ghost_hit(self, mock_get_logger, mock_time):
         """Test LFU weight increases after a hit on an entry in the LFU ghost cache."""
@@ -480,7 +480,7 @@ class TestLeCARPolicy(unittest.TestCase):
         # log_output = log_stream.getvalue()
         # self.assertIn("LFU Ghost Hit!", log_output)
 
-    @patch('src.vua.backend.time.time') # Mock time
+    @patch('vua.backend.time.time') # Mock time
     def test_update_no_learn_on_normal_hit(self, mock_time):
         """Test weights do not change on a regular cache hit (not ghost)."""
         mock_time.return_value = 1000.0
@@ -496,7 +496,7 @@ class TestLeCARPolicy(unittest.TestCase):
         self.assertEqual(self.policy.lru_weight, initial_lru_weight)
         self.assertEqual(self.policy.lfu_weight, initial_lfu_weight)
 
-    @patch('src.vua.backend.time.time') # Mock time
+    @patch('vua.backend.time.time') # Mock time
     def test_ghost_cache_ttl(self, mock_time):
         """Test that ghost cache entries expire after TTL."""
         ttl = self.policy.config.ghost_cache_ttl # Default 3600
